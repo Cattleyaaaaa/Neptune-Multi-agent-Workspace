@@ -1,0 +1,23 @@
+.env
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.next/
+node_modules/
+*.tsbuildinfo
+.pnpm-store/
+.cache/
+.tmp/
+# 本机专用（含 F 盘绝对路径），不要提交
+.npmrc
+.workbuddy/env.local.sh
+.idea/
+data/*.db
+data/*.db-*
+.next-build/
+data/skills/
