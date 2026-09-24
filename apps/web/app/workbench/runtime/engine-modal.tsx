@@ -73,7 +73,7 @@ export function EngineModal({
         })}
       </div>
       <div className="engine-foot">
-        <span>每次进入运行中心都会展示这段说明，可直接关闭；无密钥也能运行，本地规则推理不会虚构外部事实。</span>
+        <span>无密钥也能运行，本地规则推理不会虚构外部事实。</span>
         <button type="button" className="primary" onClick={onEnter}>进入工作台</button>
       </div>
     </div>

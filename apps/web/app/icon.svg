@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Neptune">
+  <!-- Neptune 图标：品牌绿底 + 强调黄绿三叉戟。
+
+       结构（不是凑坐标，是一套可复算的规则）：
+       · 32 视口，左右对称轴 x=16；图形墨迹外框 22×22，正好居中（x 5..27，y 5..27）。
+       · 横档既是"三叉的基线"，也是唯一的结构脊；三条叉都从它长出来。
+       · 三个叉同宽（均为 stroke 3 = 16px 下 1.5px），内侧净空各 3.5 单位（16px 下 1.75px）。
+       · 中叉比外叉高 6 单位（横档中心到中叉顶端 11.5，到外叉顶端 7）。
+       · 柄沿中轴下行，长度与头部相当（横档以下 7.5）。
+       · 头+横档是**一笔连续描出来的**（左尖 → 下 → 横 → 上 → 右尖），
+         所以三个转角是真转角（linejoin round），不是四段线互相叠压。
+
+       与 apps/web/app/brand-mark.tsx 同形同源，改一个必须同步另一个。 -->
+  <rect width="32" height="32" rx="7" fill="#2f6b4f"/>
+  <g fill="none" stroke="#d8f36a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6.5 11 9.5 14.5V18H22.5V14.5L25.5 11"/>
+    <path d="M16 6.5V25.5"/>
+  </g>
+</svg>

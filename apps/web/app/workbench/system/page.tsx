@@ -27,6 +27,13 @@ type SystemInfo = {
   persistence: string;
   capabilities: Capability[];
   tools: ToolDefinition[];
+  // 真实写入的安全边界：界面必须展示它，而不是让用户猜
+  write_policy?: {
+    kinds: string[];
+    file_root: string;
+    allowed_hosts: string[];
+    allow_private_hosts: boolean;
+  };
 };
 
 /* The backend reports provider names like "local-structured" /
@@ -97,6 +104,44 @@ export default function SystemPage() {
         <div className="stat-strip">
           {metrics.map(([label, value, note, Icon]) => <div key={label}><small>{label}</small><strong>{value}</strong><p>{note}</p><Icon /></div>)}
         </div>
+
+        {info?.write_policy && <section className="control-card">
+          <div className="card-title">
+            <span><HardDrives weight="duotone" /></span>
+            <div><h2>写入边界</h2><p>执行 Agent 真实写入外部系统时生效的规则，由后端强制校验</p></div>
+            <b className="card-count">{info.write_policy.kinds.length}</b>
+          </div>
+          <div className="audit-list">
+            <div className="audit-row static">
+              <HardDrives weight="duotone" />
+              <span>
+                <strong>支持的写入类型</strong>
+                <small>{info.write_policy.kinds.join("、")} · 全部需要审批后执行</small>
+              </span>
+              <b>审批门禁</b>
+            </div>
+            <div className="audit-row static">
+              <HardDrives weight="duotone" />
+              <span>
+                <strong>文件写入根目录</strong>
+                <small>{info.write_policy.file_root}</small>
+              </span>
+              <b>路径 jail</b>
+            </div>
+            <div className="audit-row static">
+              <HardDrives weight="duotone" />
+              <span>
+                <strong>HTTP 主机白名单</strong>
+                <small>
+                  {info.write_policy.allowed_hosts.length
+                    ? info.write_policy.allowed_hosts.join("、")
+                    : "未限制主机，但内网与本机地址仍会被拦截"}
+                </small>
+              </span>
+              <b>{info.write_policy.allow_private_hosts ? "允许内网" : "禁止内网"}</b>
+            </div>
+          </div>
+        </section>}
 
         <section className="control-card">
           <div className="card-title">

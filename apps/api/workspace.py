@@ -1,4 +1,3 @@
-import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -6,10 +5,32 @@ from apps.api.skills import SkillStore
 from apps.api.task_store import TaskStore
 from packages.contracts.models import WorkspaceConfig
 from packages.general_agent.capabilities import CapabilityRegistry
+from packages.general_agent.retrieval import (
+    EmbeddingProvider,
+    HashingEmbedding,
+    Hit,
+    VectorIndex,
+    keyword_rank,
+    terms,
+)
 from packages.general_agent.tools import ToolRegistry
 
 # 技能正文注入上限：提示词预算有限，技能再长也只能取开头。
 SKILL_INJECT_LIMIT = 2_000
+
+# 旧名字保留：二元组分词的入口搬到了 retrieval.terms，这里只是别名。
+retrieval_terms = terms
+
+
+def _first_int(
+    bases: list[tuple[str, dict[str, object]]], key: str, default: int
+) -> int:
+    """取知识库配置里的分块参数；取不到就用默认值。"""
+    for _, base in bases:
+        value = base.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return default
 
 
 @dataclass(frozen=True)
@@ -25,20 +46,26 @@ class ManagedContext:
     skills: list[str] = field(default_factory=list)
 
 
-def retrieval_terms(text: str) -> set[str]:
-    """检索用词：ASCII 词原样，中文切**二元组**。
+def _merge_by_id(default_items: list[dict], saved_items: list[dict]) -> list[dict]:
+    """按 id 合并配置项：保存过的覆盖同 id 项，注册表里新出现的能力沿用默认值。
 
-    这里踩过坑：原来用 `[\\w\\u4e00-\\u9fff]{2,}` 直接抓"连续中文串"，
-    结果一整句中文变成一个有 10 多个字的"词"，在文档里当然找不到 ——
-    中文知识库等于永远检索不到。没有分词器时，二元组是最实用的替代。
+    之前是整段覆盖，于是"注册表新增一个 Agent"对已经保存过配置的工作区**完全不可见**
+    —— 新能力上线后老环境静默用不上（实测：direct_agent 加进来后计划直接是空的）。
     """
-    terms: set[str] = set()
-    for chunk in re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", text):
-        if chunk[0].isascii():
-            terms.add(chunk.lower())
-        elif len(chunk) > 1:
-            terms.update(chunk[index:index + 2] for index in range(len(chunk) - 1))
-    return terms
+    saved_by_id = {
+        str(item.get("id")): item for item in saved_items if isinstance(item, dict)
+    }
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for item in default_items:
+        item_id = str(item.get("id"))
+        seen.add(item_id)
+        merged.append({**item, **saved_by_id.get(item_id, {})})
+    # 配置里存在、默认列表里没有的项（历史遗留）照旧保留，不做静默删除
+    for item in saved_items:
+        if isinstance(item, dict) and str(item.get("id")) not in seen:
+            merged.append(item)
+    return merged
 
 
 def default_workspace(registry: CapabilityRegistry, tools: ToolRegistry) -> dict[str, object]:
@@ -129,15 +156,29 @@ class WorkspaceService:
         defaults: dict[str, object],
         registry: CapabilityRegistry,
         skill_store: SkillStore | None = None,
+        embedder: EmbeddingProvider | None = None,
     ) -> None:
         self.store = store
         self.defaults = defaults
         self.registry = registry
         self.skill_store = skill_store
+        # 检索默认就是向量检索：本地确定性向量零依赖，没传 embedder 也照用。
+        self._index = VectorIndex(embedder or HashingEmbedding())
 
     def get(self) -> WorkspaceConfig:
         saved = self.store.load_workspace()
         payload = {**deepcopy(self.defaults), **(saved or {})}
+        # agents / knowledge_bases 是按 id 合并而不是整段覆盖：否则新加入的 Agent 在
+        # 保存过配置的工作区里永远不会出现。
+        for key in ("agents", "knowledge_bases"):
+            default_items = [
+                item for item in (self.defaults.get(key) or []) if isinstance(item, dict)
+            ]
+            saved_items = [
+                item for item in ((saved or {}).get(key) or []) if isinstance(item, dict)
+            ]
+            if default_items and saved_items:
+                payload[key] = _merge_by_id(default_items, saved_items)
         config = WorkspaceConfig.model_validate(payload)
         self._apply(config)
         return config
@@ -157,9 +198,9 @@ class WorkspaceService:
     def managed_context(self, objective: str, use_knowledge_base: bool = True) -> ManagedContext:
         """组装任务上下文，并按需做一次知识库检索。
 
-        检索是关键词计分（不是向量检索）：用目标里的词（中文按二元组切）去知识库
-        文档里数命中次数，取前 3 篇注入。所以界面必须把"命中了什么"回报出来，
-        否则用户无法判断这次回答到底有没有用上知识库。
+        检索默认是**向量检索**：本地确定性向量，配了 embedding 服务就走真向量。
+        向量侧拿不到任何正分命中时回退关键词计分；用哪种、命中了什么、相似度多少
+        都写进 `knowledge`，界面据此如实说明，不把关键词检索说成向量检索。
         """
         config = self.get()
         blocks = [
@@ -184,37 +225,64 @@ class WorkspaceService:
                     continue
                 blocks.append(f"[技能：{name}]\n{body[:SKILL_INJECT_LIMIT]}")
                 applied.append(name)
-        available = sum(
-            len([doc for doc in base.get("documents", []) if isinstance(doc, dict)])
-            for _, base in enabled_bases
-        )
-        hits: list[dict[str, object]] = []
 
-        if use_knowledge_base:
-            terms = retrieval_terms(objective)
-            ranked: list[tuple[int, str, str, str]] = []
-            for base_name, base in enabled_bases:
-                for document in base.get("documents", []):
-                    if not isinstance(document, dict):
-                        continue
-                    content = str(document.get("content", ""))
-                    lowered = content.lower()
-                    score = sum(lowered.count(term) for term in terms)
-                    if score:
-                        title = str(document.get("name", "知识文档"))
-                        ranked.append((score, title, content, base_name))
-            ranked.sort(reverse=True)
-            for _, name, content, base_name in ranked[:3]:
-                blocks.append(f"[知识库：{base_name}]\n{content[:4000]}")
-                hits.append({"base": base_name, "name": name})
+        corpus: list[tuple[str, str, str]] = []
+        contents: dict[tuple[str, str], str] = {}
+        for base_name, base in enabled_bases:
+            for document in base.get("documents", []):
+                if not isinstance(document, dict):
+                    continue
+                name = str(document.get("name", "知识文档"))
+                content = str(document.get("content", ""))
+                corpus.append((base_name, name, content))
+                contents[(base_name, name)] = content
+
+        hits: list[dict[str, object]] = []
+        mode = "vector" if self._index is not None else "keyword"
+        embedding_name = self._index.embedder.name if self._index else "关键词计分"
+        scanned = 0
+
+        if use_knowledge_base and corpus:
+            scanned = len(corpus)
+            results: list[Hit] = []
+            if self._index is not None:
+                results = self._index.search(
+                    objective,
+                    corpus,
+                    top_k=3,
+                    chunk_size=_first_int(enabled_bases, "chunk_size", 800),
+                    overlap=_first_int(enabled_bases, "overlap", 120),
+                )
+            if results:
+                for hit in results:
+                    blocks.append(
+                        f"[知识库：{hit.base}]\n{contents.get((hit.base, hit.name), '')[:4000]}"
+                    )
+                    hits.append({"base": hit.base, "name": hit.name, "score": hit.score})
+            else:
+                # 向量没有正分命中：退回关键词，并把退回如实写进 mode。
+                mode = "keyword"
+                embedding_name = (
+                    f"{self._index.embedder.name} → 关键词回退"
+                    if self._index
+                    else "关键词计分"
+                )
+                for hit in keyword_rank(objective, corpus):
+                    blocks.append(
+                        f"[知识库：{hit.base}]\n{contents.get((hit.base, hit.name), '')[:4000]}"
+                    )
+                    hits.append({"base": hit.base, "name": hit.name, "score": hit.score})
 
         return ManagedContext(
             text="\n\n".join(block for block in blocks if block),
             knowledge={
                 "enabled": use_knowledge_base,
                 "bases": [name for name, _ in enabled_bases],
-                "available": available,
+                "available": len(corpus),
+                "scanned": scanned,
                 "documents": hits,
+                "mode": mode,
+                "embedding": embedding_name,
             },
             skills=applied,
         )
@@ -223,9 +291,14 @@ class WorkspaceService:
         return self.get().policies
 
     def _apply(self, config: WorkspaceConfig) -> None:
+        configured = {
+            str(item.get("id")): item for item in config.agents if isinstance(item, dict)
+        }
+        # 注册表里已有但配置没提到的能力默认启用：新增 Agent 不该因为"配置里没有这一项"
+        # 就被悄悄禁用掉。
         enabled = {
-            str(item.get("id"))
-            for item in config.agents
-            if item.get("enabled") and item.get("id") != "supervisor_agent"
+            str(item["agent"])
+            for item in self.registry.definitions()
+            if configured.get(str(item["agent"]), {}).get("enabled", True)
         }
         self.registry.set_enabled(enabled)

@@ -303,7 +303,9 @@ export default function McpPage() {
   >
     <p className="detail-note">
       <Warning />
-      已探测发现的工具目前只做展示与核对，尚未接入运行时工具注册表 —— 也就是说，MCP 工具还不会被 Agent 真正调用。
+      启用且探测成功的 http 服务，其工具会接入运行时工具注册表，Agent 会真正调用它们：
+      只读工具按这里配置的「授权 Agent」可用，写入类工具只交给执行 Agent 且仍需审批门禁。
+      未探测（没有工具清单）的服务不会接入 —— 不知道入参 schema 就无法构造调用。
     </p>
 
     <StatStrip items={metrics} />

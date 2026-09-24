@@ -11,6 +11,8 @@ import { Lightning } from "@phosphor-icons/react/dist/csr/Lightning";
 import { Toolbox } from "@phosphor-icons/react/dist/csr/Toolbox";
 import { X } from "@phosphor-icons/react/dist/csr/X";
 import { Fragment, useCallback, useEffect, useState } from "react";
+import { useAuth } from "../../auth/provider";
+import { StepInspector } from "./step-inspector";
 import {
   Stage,
   StageFilter,
@@ -40,13 +42,19 @@ export function TaskDetail({
   busy,
   onDecide,
   apiUrl,
+  initialStep,
+  onStepChange,
 }: {
   task: Task | undefined;
   busy: boolean;
   onDecide: (decision: "approve" | "reject") => void;
   apiUrl: string;
+  /* 选中的步骤镜像在 ?step=<id> 上：每一步因此都有可以直接打开的地址。 */
+  initialStep?: string | null;
+  onStepChange?: (stepId: string | null) => void;
 }) {
   const [active, setActive] = useState<StageFilter>("all");
+  const [stepId, setStepId] = useState<string | null>(initialStep ?? null);
 
   // Read the stage from the hash once on mount (after hydration, so the server
   // and client first render stay identical).
@@ -57,17 +65,43 @@ export function TaskDetail({
     if (stageFilters.includes(value)) setActive(value);
   }, []);
 
+  // 外部（地址栏）变化时跟随，例如直接打开带 step 的链接、或用户前进后退
+  useEffect(() => {
+    setStepId(initialStep ?? null);
+  }, [initialStep]);
+
+  // 地址里的 step 指向一个不存在的步骤（旧链接、手改）时清掉它，别留一个打不开的地址
+  useEffect(() => {
+    if (!task || !stepId) return;
+    if (!task.plan.some((step) => step.id === stepId)) setStepId(null);
+  }, [task, stepId]);
+
+  const changeStep = useCallback((next: string | null) => {
+    setStepId(next);
+    // 用原生 replaceState 改 query：保留 hash 里的阶段选择，也不触发服务端重新渲染
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      if (next) url.searchParams.set("step", next);
+      else url.searchParams.delete("step");
+      window.history.replaceState(null, "", url.toString());
+    }
+    onStepChange?.(next);
+  }, [onStepChange]);
+
   const changeStage = useCallback((next: StageFilter) => {
     setActive(next);
     const base = window.location.pathname + window.location.search;
     window.history.replaceState(null, "", next === "all" ? base : `${base}#stage=${next}`);
   }, []);
 
+  const opened = task && stepId ? task.plan.find((step) => step.id === stepId) : undefined;
+
   return <>
     <TaskOverview task={task} apiUrl={apiUrl} />
     {task?.status === "awaiting_approval" && <ApprovalGate task={task} busy={busy} onDecide={onDecide} />}
     <StageTabs task={task} active={active} onSelect={changeStage} />
-    <StageDetails task={task} active={active} />
+    <StageDetails task={task} active={active} onOpenStep={changeStep} />
+    {task && opened && <StepInspector task={task} step={opened} onClose={() => changeStep(null)} />}
   </>;
 }
 
@@ -86,13 +120,9 @@ function TaskOverview({ task, apiUrl }: { task: Task | undefined; apiUrl: string
   const doneStages = stages.filter((stage) => stage.state === "done").length;
   const stagePercent = Math.round((doneStages / stages.length) * 100);
 
+  // 目标是页面标题，这里不再重复；只保留"这次运行是什么状态、走到哪、有多少东西可看"。
   return <section className="overview panel task-overview">
-    <div className="panel-head">
-      <span>总览</span>
-      <div><h2>{task.objective}</h2><p>任务 {task.task_id}</p></div>
-      <a className="head-link" href={`${apiUrl}/api/tasks/${task.task_id}/export`}><DownloadSimple />下载记录</a>
-    </div>
-    <div className="overview-body">
+    <div className="overview-bar">
       <div className="badges">
         <b className={`status-tag ${statusTone(task.status)}`}>{statusText(task.status)}</b>
         <b>{typeText(task.task_type)}</b>
@@ -100,27 +130,36 @@ function TaskOverview({ task, apiUrl }: { task: Task | undefined; apiUrl: string
         <b className="muted">{task.execution_mode === "plan_only" ? "仅生成计划" : "自动执行"}</b>
       </div>
 
-      <div className="progress-block">
+      <div className="overview-meters">
         <div className="progress-unit">
-          <div className="progress-head"><small>流程进度</small><small>{doneStages}/{stages.length} 阶段{current ? ` · 当前「${current.name}」` : ""}</small></div>
+          <div className="progress-head"><small>流程</small><small>{doneStages}/{stages.length}</small></div>
           <div className="progress-track"><i style={{ width: `${stagePercent}%` }} /></div>
         </div>
         <div className="progress-unit">
-          <div className="progress-head"><small>计划执行</small><small>{progress.total ? `${progress.done}/${progress.total} 步 · ${progress.percent}%` : "等待计划生成"}</small></div>
+          <div className="progress-head"><small>计划</small><small>{progress.total ? `${progress.done}/${progress.total} · ${progress.percent}%` : "待生成"}</small></div>
           <div className="progress-track"><i style={{ width: `${progress.percent}%` }} /></div>
         </div>
       </div>
 
-      <div className="stat-grid">
-        <div><small>计划步骤</small><strong>{task.plan.length}</strong></div>
-        <div><small>Agent 活动</small><strong>{task.agent_trace.length}</strong></div>
-        <div><small>工具调用</small><strong>{task.tool_trace.length}</strong></div>
-        <div><small>交付物</small><strong>{Object.keys(task.artifacts).length}</strong></div>
+      <div className="overview-counts">
+        <span><b>{task.plan.length}</b>步骤</span>
+        <span><b>{task.agent_trace.length}</b>轨迹</span>
+        <span><b>{task.tool_trace.length}</b>工具</span>
+        <span><b>{Object.keys(task.artifacts).length}</b>交付物</span>
       </div>
 
-      <div className="overview-foot"><small>更新于 {formatUpdatedAt(task.updated_at)}</small></div>
-      {task.final_response && <div className="result"><CheckCircle weight="fill" />{task.final_response}</div>}
+      <div className="overview-actions">
+        <small>更新于 {formatUpdatedAt(task.updated_at)}</small>
+        <a className="head-link" href={`${apiUrl}/api/tasks/${task.task_id}/export`}><DownloadSimple />下载记录</a>
+      </div>
     </div>
+
+    <div className="overview-foot-line">
+      <code>{task.task_id}</code>
+      {current ? <span>当前阶段「{current.name}」</span> : <span>全部阶段已完成</span>}
+    </div>
+
+    {task.final_response && <div className="result"><CheckCircle weight="fill" />{task.final_response}</div>}
   </section>;
 }
 
@@ -135,14 +174,17 @@ function ApprovalGate({
   busy: boolean;
   onDecide: (decision: "approve" | "reject") => void;
 }) {
+  const { isGuest } = useAuth();
+
   return <section className="approval-banner panel">
     <div className="approval-card">
       <div><Lightning weight="fill" /><span><strong>需要执行授权</strong><small>风险等级：{riskText(task.risk_level)} · 专业处理与质量审查已完成</small></span></div>
       <p>批准后将仅执行计划中列出的动作；拒绝则结束流程。</p>
       <div>
-        <button onClick={() => onDecide("reject")} disabled={busy}><X />拒绝</button>
-        <button className="approve" onClick={() => onDecide("approve")} disabled={busy}><CheckCircle weight="fill" />批准执行</button>
+        <button onClick={() => onDecide("reject")} disabled={busy || isGuest}><X />拒绝</button>
+        <button className="approve" onClick={() => onDecide("approve")} disabled={busy || isGuest}><CheckCircle weight="fill" />批准执行</button>
       </div>
+      {isGuest && <p className="approval-guest">访客是只读会话，不能审批。</p>}
     </div>
   </section>;
 }
@@ -182,8 +224,9 @@ function StageTabs({
         className={`filter-chip ${active === "all" ? "active" : ""}`}
         onClick={() => onSelect("all")}
       >全部</button>
-      {stages.map((stage) => (
-        <button
+      {stages.map((stage) => {
+        const count = stageCount(task, stage.key);
+        return <button
           type="button"
           role="tab"
           aria-selected={active === stage.key}
@@ -193,24 +236,41 @@ function StageTabs({
         >
           <i className={`stage-tab-dot ${stage.state}`} aria-hidden="true" />
           {stage.name}
-        </button>
-      ))}
+          {count > 0 && <em>{count}</em>}
+        </button>;
+      })}
     </div>
   </section>;
 }
 
 /* ------------------------------------------------------------------ 下部：阶段详情（随按钮切换） */
 
-function StageDetails({ task, active }: { task: Task | undefined; active: StageFilter }) {
+function StageDetails({
+  task,
+  active,
+  onOpenStep,
+}: {
+  task: Task | undefined;
+  active: StageFilter;
+  onOpenStep: (stepId: string) => void;
+}) {
   if (!task) return null;
   const stages = deriveStages(task);
   const visible = active === "all" ? stages : stages.filter((stage) => stage.key === active);
   return <div className={`stage-details ${active === "all" ? "" : "stage-single"}`}>
-    {visible.map((stage) => <StagePanel key={stage.key} task={task} stage={stage} />)}
+    {visible.map((stage) => <StagePanel key={stage.key} task={task} stage={stage} onOpenStep={onOpenStep} />)}
   </div>;
 }
 
-function StagePanel({ task, stage }: { task: Task; stage: Stage }) {
+function StagePanel({
+  task,
+  stage,
+  onOpenStep,
+}: {
+  task: Task;
+  stage: Stage;
+  onOpenStep: (stepId: string) => void;
+}) {
   const number = String(stage.index).padStart(2, "0");
   const badge = <b className={`stage-state ${stage.state}`}>{stageStateText[stage.state]}</b>;
   const artifactCount = Object.keys(task.artifacts).length;
@@ -249,7 +309,19 @@ function StagePanel({ task, stage }: { task: Task; stage: Stage }) {
       {task.plan.length ? <div className="plan-flow">{task.plan.map((step, index) => {
         const done = task.completed_agents.includes(step.agent);
         const currentStep = !done && task.plan.slice(0, index).every((item) => task.completed_agents.includes(item.agent));
-        return <div className={`${done ? "done" : ""} ${currentStep ? "current" : ""}`} key={step.id}><i>{done ? <Check /> : index + 1}</i><span><strong>{agentLabels[step.agent] ?? step.agent}</strong><small>{step.title}</small></span>{index < task.plan.length - 1 && <ArrowRight />}</div>;
+        return <Fragment key={step.id}>
+          <button
+            type="button"
+            className={`plan-step ${done ? "done" : ""} ${currentStep ? "current" : ""}`}
+            onClick={() => onOpenStep(step.id)}
+            title="查看这一步的产出、工具调用与轨迹"
+          >
+            <i>{done ? <Check /> : index + 1}</i>
+            <span><strong>{agentLabels[step.agent] ?? step.agent}</strong><small>{step.title}</small></span>
+            <em>详情<ArrowRight /></em>
+          </button>
+          {index < task.plan.length - 1 && <b className="plan-arrow"><ArrowRight /></b>}
+        </Fragment>;
       })}</div> : <Placeholder text="计划会根据任务类型动态生成。" />}
     </section>;
   }
@@ -267,8 +339,24 @@ function StagePanel({ task, stage }: { task: Task; stage: Stage }) {
 
   return <section className="panel stage-detail">
     <div className="panel-head"><span>{number}</span><div><h2>交付物</h2><p>专业 Agent 的结构化输出</p></div>{badge}</div>
-    {artifactCount ? <div className="artifact-grid">{Object.entries(task.artifacts).map(([agent, value]) => <article key={agent}><FileText weight="duotone" /><div><small>{agentLabels[agent] ?? agent}</small><strong>{String(value.title ?? "Agent 产物")}</strong><p>{artifactSummary(value)}</p></div></article>)}</div> : <Placeholder text="研究、数据、代码或文档产物将出现在这里。" />}
+    {artifactCount ? <div className="artifact-grid">{Object.entries(task.artifacts).map(([agent, value]) => {
+      // 产物属于某个 Agent；点开它等于打开那个步骤的详情（含完整字段，而不是一行摘要）
+      const owner = task.plan.find((step) => step.agent === agent);
+      const body = <><FileText weight="duotone" /><div><small>{agentLabels[agent] ?? agent}</small><strong>{String(value.title ?? "Agent 产物")}</strong><p>{artifactSummary(value)}</p></div>{owner && <em>详情<ArrowRight /></em>}</>;
+      return owner
+        ? <button type="button" className="artifact-card" key={agent} onClick={() => onOpenStep(owner.id)}>{body}</button>
+        : <article key={agent}>{body}</article>;
+    })}</div> : <Placeholder text="研究、数据、代码或文档产物将出现在这里。" />}
   </section>;
+}
+
+/* 每个阶段"有多少东西可看"，直接标在按钮上，省得点进去才发现是空的。 */
+function stageCount(task: Task, key: string): number {
+  if (key === "planning") return new Set(task.plan.map((step) => step.agent)).size;
+  if (key === "schedule") return task.plan.length;
+  if (key === "collaboration") return task.agent_trace.length;
+  if (key === "deliverables") return Object.keys(task.artifacts).length;
+  return 0;
 }
 
 function Placeholder({ text }: { text: string }) {

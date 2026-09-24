@@ -27,6 +27,7 @@ export function TaskComposer({
   onFile,
   error,
   hint,
+  readOnly = false,
   placeholder = "描述任务目标，例如：比较三种编排框架并形成选型报告",
 }: {
   objective: string;
@@ -41,6 +42,8 @@ export function TaskComposer({
   onFile: (file?: File) => void;
   error: string;
   hint?: string;
+  /* 访客是只读会话：输入与发送都禁用，并说明原因。 */
+  readOnly?: boolean;
   placeholder?: string;
 }) {
   const valid = objective.trim().length >= 3;
@@ -65,9 +68,10 @@ export function TaskComposer({
           onChange={(event) => onObjectiveChange(event.target.value)}
           onKeyDown={handleKeyDown}
           rows={2}
-          placeholder={placeholder}
+          placeholder={readOnly ? "访客是只读会话，不能发起任务" : placeholder}
+          disabled={readOnly}
         />
-        <button className="primary" disabled={busy || !valid}>
+        <button className="primary" disabled={busy || !valid || readOnly}>
           {busy ? "调度中…" : <><PaperPlaneTilt weight="fill" />发送</>}
         </button>
       </div>
@@ -88,7 +92,9 @@ export function TaskComposer({
           仅生成计划
         </label>
         <span className="input-hint">
-          {fileName ? `已附加 ${fileName}` : hint ?? "Enter 发送 · Shift + Enter 换行"}
+          {readOnly
+            ? "访客是只读会话：可以浏览运行记录与步骤，不能发起任务、审批或改动配置"
+            : fileName ? `已附加 ${fileName}` : hint ?? "Enter 发送 · Shift + Enter 换行"}
         </span>
       </div>
 

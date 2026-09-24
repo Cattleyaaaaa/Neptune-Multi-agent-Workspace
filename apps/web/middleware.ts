@@ -6,7 +6,7 @@ import { NextResponse, type NextRequest } from "next/server";
    这里只检查刷新令牌"存不存在、有没有过期"——签名校验放在后端 API 上。
    中间件里只读 payload 的 exp 是为了避免把已过期的用户放进工作台又立刻被弹回来。 */
 
-const REFRESH_COOKIE = "nexus_refresh";
+const REFRESH_COOKIE = "neptune_refresh";
 const LOGIN_PATH = "/login";
 const HOME_PATH = "/workbench/runtime";
 

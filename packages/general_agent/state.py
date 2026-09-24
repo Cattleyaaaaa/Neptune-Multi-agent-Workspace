@@ -31,6 +31,11 @@ class GeneralTaskState(TypedDict):
     phase: str
     conversation_id: NotRequired[str | None]
     requested_agent: NotRequired[str | None]
+    # 真实写入目标（http / file / database）。有它且非 dry_run 时计划会强制追加审批门禁。
+    execution_target: NotRequired[dict[str, object] | None]
+    dry_run: NotRequired[bool]
+    # 运行模式：graph = 固定图编排；react = 自由 ReAct 循环。
+    run_mode: NotRequired[str]
     knowledge: NotRequired[dict[str, object]]
     applied_skills: NotRequired[list[str]]
     task_type: NotRequired[str]

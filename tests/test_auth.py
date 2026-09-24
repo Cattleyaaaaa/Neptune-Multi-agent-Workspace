@@ -446,12 +446,29 @@ def test_role_is_read_from_the_database_not_the_token(tmp_path: Path) -> None:
 # ---------------------------------------------------------------- 注册
 
 
+def register_body(client: TestClient, **overrides: object) -> dict:
+    """走真实的注册前流程：先取算术验证码、把答案算出来、填写时长填够。
+
+    注册端现在有四道校验（蜜罐 / 填写时长 / 图形验证码 / 邮箱验证），
+    测试不该绕过它们 —— 那正是要覆盖的部分。
+    """
+    captcha = client.get("/api/auth/captcha").json()
+    left, _, rest = captcha["question"].partition(" + ")
+    body: dict = {
+        "username": "zhang.wei",
+        "password": "member-pass-1",
+        "display_name": "张维",
+        "captcha_id": captcha["challenge_id"],
+        "captcha_answer": str(int(left) + int(rest.split(" ")[0])),
+        "form_elapsed_ms": 5000,
+    }
+    body.update(overrides)
+    return body
+
+
 def test_register_creates_a_member_and_signs_in(app: FastAPI) -> None:
     client = TestClient(app)
-    response = client.post(
-        "/api/auth/register",
-        json={"username": "zhang.wei", "password": "member-pass-1", "display_name": "张维"},
-    )
+    response = client.post("/api/auth/register", json=register_body(client))
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["user"]["username"] == "zhang.wei"
@@ -464,16 +481,20 @@ def test_register_creates_a_member_and_signs_in(app: FastAPI) -> None:
 
 
 def test_register_without_display_name_falls_back_to_username(app: FastAPI) -> None:
-    response = TestClient(app).post(
-        "/api/auth/register", json={"username": "plain.user", "password": "member-pass-1"}
+    client = TestClient(app)
+    response = client.post(
+        "/api/auth/register",
+        json=register_body(client, username="plain.user", display_name=None),
     )
     assert response.status_code == 201
     assert response.json()["user"]["display_name"] == "plain.user"
 
 
 def test_register_rejects_duplicate_username(app: FastAPI) -> None:
-    response = TestClient(app).post(
-        "/api/auth/register", json={"username": USERNAME, "password": "member-pass-1"}
+    client = TestClient(app)
+    response = client.post(
+        "/api/auth/register",
+        json=register_body(client, username=USERNAME),
     )
     assert response.status_code == 409
 
@@ -512,12 +533,71 @@ def test_registration_is_throttled_per_ip(app: FastAPI, monkeypatch) -> None:
     for index in range(2):
         created = client.post(
             "/api/auth/register",
-            json={"username": f"user-{index}", "password": "member-pass-1"},
+            json=register_body(client, username=f"user-{index}", display_name=f"用户{index}"),
         )
         assert created.status_code == 201
 
     throttled = client.post(
-        "/api/auth/register", json={"username": "user-x", "password": "member-pass-1"}
+        "/api/auth/register",
+        json=register_body(client, username="user-x", display_name="用户x"),
     )
     assert throttled.status_code == 429
     assert "Retry-After" in throttled.headers
+
+
+# --- 反代下的真实客户端 IP -------------------------------------------------
+# 注册节流按这个值计数，取错段就等于限额失效。这两种头部形态都必须指向真实来源：
+#   * nginx 用 $proxy_add_x_forwarded_for → "伪造值, 真实值"
+#   * nginx 用 $remote_addr（覆盖写）    → "真实值"
+def test_client_ip_uses_the_last_forwarded_hop() -> None:
+    from starlette.requests import Request
+
+    from apps.api.auth import _client_ip
+
+    def make(header: str | None) -> Request:
+        headers = []
+        if header is not None:
+            headers.append((b"x-forwarded-for", header.encode()))
+        return Request({"type": "http", "headers": headers, "client": ("10.0.0.9", 1234)})
+
+    # 追加写：客户端伪造的那段在最前，真实来源在最后
+    assert _client_ip(make("1.2.3.4, 203.0.113.7")) == "203.0.113.7"
+    # 覆盖写：只有一段
+    assert _client_ip(make("203.0.113.7")) == "203.0.113.7"
+    # 头里有多余空格 / 空段也不能影响
+    assert _client_ip(make("1.2.3.4 ,, 203.0.113.7")) == "203.0.113.7"
+    # 没有反代时退回 socket 地址
+    assert _client_ip(make(None)) == "10.0.0.9"
+
+
+# --- Cloudflare 后面的真实客户端 IP ----------------------------------------
+# CF 对 X-Forwarded-For 是「追加」语义，且会额外写 CF-Connecting-IP。
+# 采信哪个是部署拓扑问题，所以用开关控制：不在 CF 后面却采信它 = 可伪造来源。
+def test_cloudflare_header_is_used_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+
+    from apps.api.auth import _client_ip
+    from apps.api.settings import settings
+
+    def make(**headers: str) -> Request:
+        pairs = [
+            (name.replace("_", "-").encode(), value.encode()) for name, value in headers.items()
+        ]
+        return Request({"type": "http", "headers": pairs, "client": ("10.0.0.9", 1234)})
+
+    monkeypatch.setattr(settings, "trust_cloudflare_ip", False)
+    assert (
+        _client_ip(make(cf_connecting_ip="1.2.3.4", x_forwarded_for="1.2.3.4, 203.0.113.7"))
+        == "203.0.113.7"
+    ), "没开开关时不能采信 CF 头，否则一个请求头就能绕过按 IP 的节流"
+
+    monkeypatch.setattr(settings, "trust_cloudflare_ip", True)
+    assert (
+        _client_ip(make(cf_connecting_ip="198.51.100.7", x_forwarded_for="1.2.3.4, 172.71.0.1"))
+        == "198.51.100.7"
+    ), "在 CF 后面应优先用边缘写入的 CF-Connecting-IP"
+    assert (
+        _client_ip(make(cf_connecting_ip="   ", x_forwarded_for="203.0.113.7")) == "203.0.113.7"
+    ), "CF 头为空时要退回 X-Forwarded-For，不能返回空串"

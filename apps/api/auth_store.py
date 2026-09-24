@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROLE_ADMIN = "admin"
 ROLE_MEMBER = "member"
+ROLE_GUEST = "guest"
 
 JWT_SECRET_NAME = "jwt_secret"
 
@@ -45,6 +46,7 @@ class AuthStore:
         password_hash: str,
         role: str = ROLE_MEMBER,
         must_change_password: bool = False,
+        email: str | None = None,
         now: int | None = None,
     ) -> None:
         with closing(self._connect()) as connection, connection:
@@ -52,8 +54,8 @@ class AuthStore:
                 """
                 INSERT INTO users (
                     user_id, username, display_name, role, password_hash,
-                    must_change_password, failed_attempts, locked_until
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+                    must_change_password, failed_attempts, locked_until, email
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
                 """,
                 (
                     user_id,
@@ -62,6 +64,7 @@ class AuthStore:
                     role,
                     password_hash,
                     1 if must_change_password else 0,
+                    email,
                 ),
             )
 
@@ -230,6 +233,97 @@ class AuthStore:
             row = connection.execute(query, params).fetchone()
         return dict(row) if row else None
 
+    # ------------------------------------------------------------ 一次性校验凭据
+    # 图形验证码与邮箱验证码共用一张表：只存哈希、有 TTL、计尝试次数、用后标记 consumed。
+
+    def create_challenge(
+        self,
+        *,
+        challenge_id: str,
+        kind: str,
+        target: str,
+        secret_hash: str,
+        expires_at: int,
+        now: int,
+    ) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO auth_challenges
+                    (challenge_id, kind, target, secret_hash, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (challenge_id, kind, target, secret_hash, expires_at, now),
+            )
+
+    def get_challenge(self, challenge_id: str) -> dict[str, object] | None:
+        return self._one(
+            "SELECT * FROM auth_challenges WHERE challenge_id = ?", (challenge_id,)
+        )
+
+    def consume_challenge(self, challenge_id: str, *, now: int) -> None:
+        """标记已用 —— 一次性凭据验证通过后必须立刻消费，否则可以被反复重放。"""
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "UPDATE auth_challenges SET consumed_at = ? WHERE challenge_id = ?",
+                (now, challenge_id),
+            )
+
+    def bump_challenge_attempts(self, challenge_id: str) -> int:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "UPDATE auth_challenges SET attempts = attempts + 1 WHERE challenge_id = ?",
+                (challenge_id,),
+            )
+            row = connection.execute(
+                "SELECT attempts FROM auth_challenges WHERE challenge_id = ?", (challenge_id,)
+            ).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def count_recent_challenges(self, *, kind: str, target: str, since: int) -> int:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total FROM auth_challenges
+                WHERE kind = ? AND target = ? AND created_at >= ?
+                """,
+                (kind, target, since),
+            ).fetchone()
+        return int(row["total"]) if row else 0
+
+    def last_challenge_at(self, *, kind: str, target: str) -> int:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(created_at) AS latest FROM auth_challenges
+                WHERE kind = ? AND target = ?
+                """,
+                (kind, target),
+            ).fetchone()
+        return int(row["latest"] or 0) if row else 0
+
+    def latest_challenge(self, *, kind: str, target: str) -> dict[str, object] | None:
+        """最近一条凭据。邮箱验证码没有 challenge_id 交给前端（不该让客户端挑凭据），
+        所以注册时按"邮箱 + 最近一条"来校验。"""
+        return self._one(
+            """
+            SELECT * FROM auth_challenges
+            WHERE kind = ? AND target = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (kind, target),
+        )
+
+    def prune_challenges(self, *, before: int) -> int:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM auth_challenges WHERE created_at < ?", (before,)
+            )
+        return cursor.rowcount or 0
+
+    def get_user_by_email(self, email: str) -> dict[str, object] | None:
+        return self._one("SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,))
+
     def _initialize(self) -> None:
         with closing(self._connect()) as connection, connection:
             connection.executescript(
@@ -245,7 +339,9 @@ class AuthStore:
                     locked_until INTEGER NOT NULL DEFAULT 0,
                     disabled INTEGER NOT NULL DEFAULT 0,
                     last_login_at TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    -- 注册时验证过的邮箱；老账号没有，所以允许 NULL。
+                    email TEXT
                 );
                 -- 用户名大小写不敏感地唯一：admin 与 Admin 不能同时存在。
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
@@ -269,12 +365,33 @@ class AuthStore:
                     value TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                -- 一次性的校验凭据：图形验证码（captcha）与邮箱验证码（email_code）共用一张表。
+                -- 与刷新令牌同样的口径：只存哈希，不存明文；过期、尝试次数、是否已用都在这里管。
+                CREATE TABLE IF NOT EXISTS auth_challenges (
+                    challenge_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT '',
+                    secret_hash TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    expires_at INTEGER NOT NULL,
+                    consumed_at INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_challenges_kind_target
+                    ON auth_challenges (kind, target, created_at);
                 """
             )
             # 这个库没有迁移框架，所以用最朴素的方式补列：老库（缺列）能直接升上来，
             # 新库执行到这里是空操作。加列时请同步更新上面的 CREATE TABLE。
             self._ensure_column(
                 connection, "users", "disabled", "disabled INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(connection, "users", "email", "email TEXT")
+            # 邮箱唯一索引必须建在补列之后 —— 老库执行上面的 CREATE INDEX 时还没有 email 列，
+            # 会直接报 "no such column"。NULL 不参与唯一性，所以老账号共存无碍。
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email "
+                "ON users (email COLLATE NOCASE) WHERE email IS NOT NULL"
             )
 
     def _ensure_column(

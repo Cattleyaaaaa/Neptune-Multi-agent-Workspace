@@ -126,7 +126,11 @@ async def test_knowledge_base_hit_is_injected_and_reported(tmp_path: Path) -> No
     assert task.knowledge["enabled"] is True
     assert task.knowledge["bases"] == ["通用知识库"]
     assert task.knowledge["available"] == 1
-    assert task.knowledge["documents"] == [{"base": "通用知识库", "name": "规范.md"}]
+    # 检索是向量检索：命中结果带相似度分数，并如实标注用的哪种检索
+    assert task.knowledge["mode"] == "vector"
+    assert task.knowledge["documents"][0]["base"] == "通用知识库"
+    assert task.knowledge["documents"][0]["name"] == "规范.md"
+    assert task.knowledge["documents"][0]["score"] > 0
 
 
 @pytest.mark.asyncio

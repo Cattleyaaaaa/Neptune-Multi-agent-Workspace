@@ -165,7 +165,7 @@ export default function AuditPage() {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "nexus-audit-tool-calls.csv";
+    anchor.download = "neptune-audit-tool-calls.csv";
     anchor.click();
     URL.revokeObjectURL(url);
     push(`已导出 ${visibleCalls.length} 条工具调用记录`);

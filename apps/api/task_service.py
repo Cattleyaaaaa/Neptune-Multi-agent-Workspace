@@ -3,6 +3,8 @@ import logging
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -15,6 +17,7 @@ from packages.general_agent.capabilities import CapabilityRegistry
 from packages.general_agent.graph import build_general_graph
 from packages.general_agent.reasoning import ReasoningProvider
 from packages.general_agent.state import GeneralTaskState
+from packages.general_agent.tools import ToolRegistry
 
 
 class TaskNotFoundError(KeyError):
@@ -25,6 +28,14 @@ class InvalidTaskStateError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class Viewer:
+    """谁在看这份任务列表。管理员看全部，其他人只看自己创建的。"""
+
+    user_id: str
+    is_admin: bool = False
+
+
 class TaskService:
     def __init__(
         self,
@@ -33,25 +44,32 @@ class TaskService:
         registry: CapabilityRegistry | None = None,
         context_provider: Callable[[str, bool], ManagedContext] | None = None,
         policy_provider: Callable[[], dict[str, object]] | None = None,
+        tools: ToolRegistry | None = None,
     ) -> None:
-        self._graph = build_general_graph(InMemorySaver(), reasoner, registry)
+        self._tools = tools or ToolRegistry(Path(__file__).resolve().parents[2])
+        self._graph = build_general_graph(InMemorySaver(), reasoner, registry, self._tools)
         self._store = store
         self._context_provider = context_provider
         self._policy_provider = policy_provider
         self._tasks = store.load_tasks() if store else {}
+        self._owners: dict[str, str | None] = store.load_task_owners() if store else {}
         saved_events = store.load_events() if store else {}
         self._events: dict[str, list[dict[str, object]]] = defaultdict(list, saved_events)
         self._conditions: dict[str, asyncio.Condition] = defaultdict(asyncio.Condition)
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-    async def create_task(self, request: StartTaskRequest) -> TaskView:
+    async def create_task(
+        self, request: StartTaskRequest, owner_id: str | None = None
+    ) -> TaskView:
         task_id = uuid.uuid4().hex[:12]
         thread_id = str(uuid.uuid4())
-        managed = (
-            self._context_provider(request.objective, request.use_knowledge_base)
-            if self._context_provider
-            else ManagedContext("")
-        )
+        if self._context_provider is None:
+            managed = ManagedContext("")
+        else:
+            # 检索可能调用远程 embedding 服务，放进线程避免阻塞事件循环。
+            managed = await asyncio.to_thread(
+                self._context_provider, request.objective, request.use_knowledge_base
+            )
         policies = self._policy_provider() if self._policy_provider else {}
         max_steps = min(request.max_steps, int(policies.get("max_steps", request.max_steps)))
         timeout_seconds = min(
@@ -72,6 +90,9 @@ class TaskService:
             "phase": "intake",
             "conversation_id": request.conversation_id,
             "requested_agent": request.agent,
+            "execution_target": request.execution_target,
+            "dry_run": request.dry_run,
+            "run_mode": request.run_mode,
             "knowledge": managed.knowledge,
             "applied_skills": managed.skills,
             "completed_agents": [],
@@ -80,13 +101,16 @@ class TaskService:
             "tool_trace": [],
         }
         self._tasks[task_id] = initial
-        self._persist(initial)
+        self._owners[task_id] = owner_id
+        self._persist(initial, owner_id)
         await self._publish(task_id, "task.started", {"phase": "intake"})
         await self._run(task_id, thread_id, initial)
         return self.get_task(task_id)
 
-    async def decide(self, task_id: str, decision: ApprovalDecision) -> TaskView:
-        self._require(task_id)
+    async def decide(
+        self, task_id: str, decision: ApprovalDecision, viewer: Viewer | None = None
+    ) -> TaskView:
+        self._require_visible(task_id, viewer)
         async with self._locks[task_id]:
             task = self._require(task_id)
             if task["status"] != "awaiting_approval":
@@ -98,14 +122,30 @@ class TaskService:
             await self._run(task_id, task["thread_id"], Command(resume=payload))
             return self.get_task(task_id)
 
-    def get_task(self, task_id: str) -> TaskView:
-        return TaskView.model_validate(self._require(task_id))
+    def can_view(self, task_id: str, viewer: Viewer | None) -> bool:
+        if viewer is None or viewer.is_admin:
+            return True
+        owner = self._owners.get(task_id)
+        return owner is not None and owner == viewer.user_id
 
-    def list_tasks(self) -> list[TaskView]:
-        return [TaskView.model_validate(task) for task in reversed(list(self._tasks.values()))]
+    def get_task(self, task_id: str, viewer: Viewer | None = None) -> TaskView:
+        return TaskView.model_validate(self._require_visible(task_id, viewer))
 
-    async def events(self, task_id: str, after: int = 0) -> AsyncIterator[dict[str, object]]:
-        self._require(task_id)
+    def list_tasks(self, viewer: Viewer | None = None) -> list[TaskView]:
+        return [
+            TaskView.model_validate(task)
+            for task in reversed(list(self._tasks.values()))
+            if self.can_view(str(task["task_id"]), viewer)
+        ]
+
+    def tool_definitions(self) -> list[dict[str, object]]:
+        """内置工具 + 已接入的 MCP 工具，供运行环境页与前端展示。"""
+        return self._tools.definitions()
+
+    async def events(
+        self, task_id: str, after: int = 0, viewer: Viewer | None = None
+    ) -> AsyncIterator[dict[str, object]]:
+        self._require_visible(task_id, viewer)
         cursor = max(after, 0)
         while True:
             events = self._events[task_id]
@@ -167,6 +207,12 @@ class TaskService:
         except KeyError as exc:
             raise TaskNotFoundError(task_id) from exc
 
+    def _require_visible(self, task_id: str, viewer: Viewer | None) -> GeneralTaskState:
+        # 看不到的任务按「不存在」处理：不告诉调用方这个 id 是否真的存在
+        if not self.can_view(task_id, viewer):
+            raise TaskNotFoundError(task_id)
+        return self._require(task_id)
+
     @staticmethod
     def _config(thread_id: str) -> dict[str, dict[str, str]]:
         return {"configurable": {"thread_id": thread_id}}
@@ -195,6 +241,9 @@ class TaskService:
             "phase": "intake",
             "conversation_id": task.get("conversation_id"),
             "requested_agent": task.get("requested_agent"),
+            "execution_target": task.get("execution_target"),
+            "dry_run": task.get("dry_run", False),
+            "run_mode": task.get("run_mode", "graph"),
             "knowledge": task.get("knowledge", {}),
             "applied_skills": task.get("applied_skills", []),
             "completed_agents": [],
@@ -213,8 +262,9 @@ class TaskService:
             task_id, "task.updated", {"phase": phase, "status": "needs_human"}
         )
 
-    def _persist(self, state: GeneralTaskState) -> None:
+    def _persist(self, state: GeneralTaskState, owner_id: str | None = None) -> None:
         if self._store:
             # Keep the in-memory timestamp moving so a running task shows a
             # fresh "updated" time instead of the value read at startup.
-            state["updated_at"] = self._store.save_task(state)
+            # 更新时不传 owner_id，存储层用 COALESCE 保留原归属。
+            state["updated_at"] = self._store.save_task(state, owner_id)

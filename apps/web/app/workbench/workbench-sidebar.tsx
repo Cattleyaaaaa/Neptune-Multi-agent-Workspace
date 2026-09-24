@@ -18,14 +18,16 @@ import { Paperclip } from "@phosphor-icons/react/dist/csr/Paperclip";
 import { PlugsConnected } from "@phosphor-icons/react/dist/csr/PlugsConnected";
 import { PuzzlePiece } from "@phosphor-icons/react/dist/csr/PuzzlePiece";
 import { ShieldCheck } from "@phosphor-icons/react/dist/csr/ShieldCheck";
+import { LockSimple } from "@phosphor-icons/react/dist/csr/LockSimple";
 import { SignOut } from "@phosphor-icons/react/dist/csr/SignOut";
-import { Sparkle } from "@phosphor-icons/react/dist/csr/Sparkle";
 import { UsersThree } from "@phosphor-icons/react/dist/csr/UsersThree";
 import { Warning } from "@phosphor-icons/react/dist/csr/Warning";
 import { Wrench } from "@phosphor-icons/react/dist/csr/Wrench";
 import Link from "next/link";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import type { ComponentType } from "react";
 import { useAuth } from "../auth/provider";
+import { BrandMark } from "../brand-mark";
 
 type NavIcon = ComponentType<{ weight?: "thin" | "light" | "regular" | "bold" | "fill" | "duotone" }>;
 
@@ -100,7 +102,7 @@ export const navGroups: NavGroup[] = [
     id: "workspace",
     label: "工作区设置",
     items: [
-      { kind: "route", id: "tenants", label: "租户与成员", icon: Buildings, href: "/workbench/tenants" },
+      { kind: "route", id: "tenants", label: "成员与角色", icon: Buildings, href: "/workbench/tenants" },
       { kind: "route", id: "settings", label: "账号设置", icon: GearSix, href: "/workbench/settings" },
     ],
   },
@@ -114,9 +116,12 @@ export const workspaceSections = navGroups
 
 const allItems = navGroups.flatMap((group) => group.items);
 
-/* Points at the FastAPI docs. Mirrors the rewrite target in next.config.ts so
-   the link stays correct when NEXT_PUBLIC_API_URL is overridden. */
-const API_DOCS_URL = `${(process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "")}/docs`;
+/* Points at the FastAPI docs.
+   没配 NEXT_PUBLIC_API_URL 时用**相对路径**，由 next.config.ts 把 /docs 同源代理到后端 ——
+   写死 http://localhost:8000 的话，部署到域名后这个链接指向访客自己的本机，必然打不开。 */
+const API_DOCS_URL = process.env.NEXT_PUBLIC_API_URL
+  ? `${process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, "")}/docs`
+  : "/docs";
 
 export function findSectionLabel(location: WorkbenchLocation) {
   return allItems.find((item) => item.id === location)?.label ?? "编排总览";
@@ -150,6 +155,36 @@ export function locationFromPathname(pathname: string): RouteId | null {
    the URL still tracks the section so a reload or shared link works. */
 /* 当前账号。侧边栏在 rail 最底部固定展示，所以退出登录在任何页面都点得到，
    不必再塞一个重复的「账号设置」入口——设置页本身就在导航里。 */
+/* 侧边栏的滚动位置。
+   它在每个页面里各自渲染，路由一换就整个重建，组件内的状态会跟着消失 —— 所以存到
+   sessionStorage（整页刷新也还在），挂载时在绘制前还原。useLayoutEffect 在绘制前执行，
+   不会先闪一下顶部；服务端渲染阶段没有 window，退回 useEffect。 */
+const NAV_SCROLL_KEY = "neptune.workbench.v1.navScroll";
+
+function readNavScroll(): number {
+  if (typeof window === "undefined") return 0;
+  const value = Number(window.sessionStorage.getItem(NAV_SCROLL_KEY) ?? "0");
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function writeNavScroll(value: number): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(NAV_SCROLL_KEY, String(Math.max(0, Math.round(value))));
+  } catch {
+    /* 隐私模式写不进去，退化成"不记忆"，不影响使用 */
+  }
+}
+const useIsomorphicLayoutEffect =
+  typeof window === "undefined" ? useEffect : useLayoutEffect;
+
+/* 角色文案：访客必须单独标出来 —— 它确实只能看，说成"成员"是错的。 */
+function roleText(role: string) {
+  if (role === "admin") return "管理员";
+  if (role === "guest") return "访客（只读）";
+  return "成员";
+}
+
 function AccountBlock() {
   const { user, status, logout } = useAuth();
   const initial =
@@ -159,9 +194,12 @@ function AccountBlock() {
       <span className="control-user-avatar" aria-hidden="true">{initial}</span>
       <div className="control-user-text">
         <strong>{user?.display_name ?? (status === "loading" ? "读取中…" : "未登录")}</strong>
-        <small>{user ? `@${user.username} · ${user.role === "admin" ? "管理员" : "成员"}` : "—"}</small>
+        <small>{user ? `@${user.username} · ${roleText(user.role)}` : "—"}</small>
       </div>
     </div>
+    {user?.role === "guest" && <p className="control-user-guest">
+      <LockSimple />访客是只读会话：可以浏览，不能发起任务、审批或改动配置
+    </p>}
     {user?.must_change_password && <p className="control-user-warn">
       <Warning />仍在使用初始密码，请到「账号设置」修改
     </p>}
@@ -178,10 +216,24 @@ export function WorkbenchSidebar({
   active: WorkbenchLocation;
   onSelectSection?: (id: WorkspaceSection) => void;
 }) {
+  const navRef = useRef<HTMLElement | null>(null);
+
+  useIsomorphicLayoutEffect(() => {
+    const node = navRef.current;
+    const remembered = readNavScroll();
+    if (node && remembered > 0) node.scrollTop = remembered;
+  }, []);
+
   return <aside className="control-rail">
-    <Link className="control-logo" href="/workbench/runtime"><span><Sparkle weight="fill" /></span><div><strong>Nexus</strong><small>CONTROL PLANE</small></div></Link>
+    <Link className="control-logo" href="/workbench/runtime"><span><BrandMark /></span><div><strong>Neptune</strong><small>CONTROL PLANE</small></div></Link>
     <div className="control-status"><i /><span><strong>工作区在线</strong><small>SQLite · 本地持久化</small></span></div>
-    <nav className="nav-groups">
+    <nav
+      className="nav-groups"
+      ref={navRef}
+      onScroll={(event) => {
+        writeNavScroll(event.currentTarget.scrollTop);
+      }}
+    >
       {navGroups.map((group) => (
         <div className="nav-group" key={group.id}>
           <p className="nav-label">{group.label}</p>

@@ -4,10 +4,10 @@ import { CheckCircle } from "@phosphor-icons/react/dist/csr/CheckCircle";
 import { Eye } from "@phosphor-icons/react/dist/csr/Eye";
 import { EyeSlash } from "@phosphor-icons/react/dist/csr/EyeSlash";
 import { ShieldCheck } from "@phosphor-icons/react/dist/csr/ShieldCheck";
-import { Sparkle } from "@phosphor-icons/react/dist/csr/Sparkle";
 import { Warning } from "@phosphor-icons/react/dist/csr/Warning";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl, toErrorMessage } from "../auth/api";
+import { BrandMark } from "../brand-mark";
 import "../workspace-layout.css";
 
 type Mode = "login" | "register";
@@ -55,6 +55,86 @@ export default function LoginPage() {
   const [signUpDisplay, setSignUpDisplay] = useState("");
   const [signUpErrors, setSignUpErrors] = useState<Record<string, string>>({});
 
+  // 注册端的四道防线（见 docs/architecture.md「注册端防滥用」）。
+  // 前两项由服务端判定，这里只负责把真实值交上去：蜜罐字段与表单停留时长。
+  const [captcha, setCaptcha] = useState<{ id: string; question: string } | null>(null);
+  const [captchaAnswer, setCaptchaAnswer] = useState("");
+  const [captchaError, setCaptchaError] = useState("");
+  const [emailVerificationRequired, setEmailVerificationRequired] = useState(false);
+  const [signUpEmail, setSignUpEmail] = useState("");
+  const [signUpEmailCode, setSignUpEmailCode] = useState("");
+  const [emailSending, setEmailSending] = useState(false);
+  const [emailCooldown, setEmailCooldown] = useState(0);
+  const [emailNotice, setEmailNotice] = useState("");
+  const [signUpWebsite, setSignUpWebsite] = useState("");
+  const signUpOpenedAt = useRef(Date.now());
+
+  const refreshCaptcha = useCallback(async () => {
+    setCaptchaAnswer("");
+    setCaptchaError("");
+    try {
+      const response = await fetch(apiUrl("/api/auth/captcha"), { credentials: "include" });
+      if (!response.ok) throw new Error();
+      const data = (await response.json()) as {
+        challenge_id: string;
+        question: string;
+        email_verification_required: boolean;
+      };
+      setCaptcha({ id: data.challenge_id, question: data.question });
+      // 要不要填邮箱由服务端说了算：没配 SMTP 就不显示那一栏，也不该假装在验证
+      setEmailVerificationRequired(Boolean(data.email_verification_required));
+    } catch {
+      setCaptcha(null);
+      setCaptchaError("验证码加载失败，请刷新页面重试");
+    }
+  }, []);
+
+  // 每次进入注册模式：重新计时（填写时长从"看到表单"开始算），并取一道新题
+  useEffect(() => {
+    if (mode !== "register") return;
+    signUpOpenedAt.current = Date.now();
+    void refreshCaptcha();
+  }, [mode, refreshCaptcha]);
+
+  // 验证码重发倒计时。60 秒与后端 email_code_resend_seconds 对应。
+  useEffect(() => {
+    if (emailCooldown <= 0) return;
+    const timer = window.setInterval(() => {
+      setEmailCooldown((value) => Math.max(0, value - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [emailCooldown]);
+
+  async function sendEmailCode() {
+    if (emailSending || emailCooldown > 0) return;
+    if (!signUpEmail.trim()) {
+      setEmailNotice("请先填写邮箱");
+      return;
+    }
+    setEmailSending(true);
+    setEmailNotice("");
+    try {
+      const response = await fetch(apiUrl("/api/auth/email-code"), {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: signUpEmail.trim() }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        // 未配置邮件服务时后端会明确回 503，这里如实转达，不谎称"已发送"
+        setEmailNotice(toErrorMessage(payload, "验证码发送失败，请稍后重试"));
+        return;
+      }
+      setEmailNotice("验证码已发送，请查收邮件（10 分钟内有效）");
+      setEmailCooldown(60);
+    } catch {
+      setEmailNotice("无法连接后端服务，请确认 API 已启动");
+    } finally {
+      setEmailSending(false);
+    }
+  }
+
   // 用 window.location 而不是 useSearchParams：后者需要 Suspense 包裹才能构建。
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -101,6 +181,15 @@ export default function LoginPage() {
     }
   }
 
+  async function enterAsGuest() {
+    if (phase === "submitting") return;
+    // 访客同样用 cookie 会话；这里复用 post() 的错误处理，失败时把原因显示出来。
+    if (await post("/api/auth/guest", {})) {
+      setNotice("以访客身份进入，只读浏览。");
+      window.location.assign(next);
+    }
+  }
+
   function validateSignUp(): boolean {
     const problems: Record<string, string> = {};
     if (!USERNAME_PATTERN.test(signUpName.trim())) {
@@ -116,15 +205,34 @@ export default function LoginPage() {
     event.preventDefault();
     if (phase === "submitting") return;
     if (!validateSignUp()) return;
+    if (!captchaAnswer.trim()) {
+      setError("请填写验证码");
+      return;
+    }
+    if (emailVerificationRequired && (!signUpEmail.trim() || !signUpEmailCode.trim())) {
+      setError("请完成邮箱验证（填写邮箱并输入收到的验证码）");
+      return;
+    }
     const ok = await post("/api/auth/register", {
       username: signUpName.trim(),
       password: signUpPassword,
       display_name: signUpDisplay.trim() || null,
+      // 蜜罐：真人这条永远是空的；填写时长：从看到表单算起
+      website: signUpWebsite,
+      form_elapsed_ms: Date.now() - signUpOpenedAt.current,
+      captcha_id: captcha?.id ?? "",
+      captcha_answer: captchaAnswer.trim(),
+      ...(emailVerificationRequired
+        ? { email: signUpEmail.trim(), email_code: signUpEmailCode.trim() }
+        : {}),
     });
     if (ok) {
       setNotice("注册成功，正在进入工作台…");
       window.location.assign(next);
+      return;
     }
+    // 验证码是一次性的：任何失败之后都得换一张，否则用户会一直拿着已作废的凭据重试
+    void refreshCaptcha();
   }
 
   function switchMode(target: Mode) {
@@ -137,8 +245,8 @@ export default function LoginPage() {
   return <main className="login-shell">
     <section className="login-intro">
       <header className="login-brand">
-        <span className="login-mark"><Sparkle weight="fill" /></span>
-        <div><strong>Nexus</strong><small>AGENT CONTROL PLANE</small></div>
+        <span className="login-mark"><BrandMark /></span>
+        <div><strong>Neptune</strong><small>AGENT CONTROL PLANE</small></div>
       </header>
 
       <div className="login-hero">
@@ -239,6 +347,18 @@ export default function LoginPage() {
           <p className="login-switch">
             还没有账号？<button type="button" onClick={() => switchMode("register")}>创建用户和密码</button>
           </p>
+
+          <div className="login-guest">
+            <button
+              type="button"
+              className="login-guest-btn"
+              onClick={() => void enterAsGuest()}
+              disabled={phase === "submitting"}
+            >
+              以访客身份进入
+            </button>
+            <small>不必注册。可以浏览运行记录与步骤，但不能发起任务、审批或改动配置。</small>
+          </div>
         </form> : <form onSubmit={(event) => void submitRegister(event)} noValidate>
           <label className="login-field">
             <span>用户名</span>
@@ -296,6 +416,84 @@ export default function LoginPage() {
             />
             {signUpErrors.confirm && <em className="login-field-error">{signUpErrors.confirm}</em>}
           </label>
+
+          {emailVerificationRequired && <label className="login-field">
+            <span>邮箱<em>*</em></span>
+            <span className="login-inline">
+              <input
+                type="email"
+                value={signUpEmail}
+                onChange={(event) => setSignUpEmail(event.target.value)}
+                autoComplete="email"
+                placeholder="you@example.com"
+                required
+              />
+              <button
+                type="button"
+                className="login-inline-btn"
+                onClick={() => void sendEmailCode()}
+                disabled={emailCooldown > 0 || emailSending}
+              >
+                {emailSending
+                  ? "发送中…"
+                  : emailCooldown > 0
+                    ? `${emailCooldown} 秒后重发`
+                    : "发送验证码"}
+              </button>
+            </span>
+          </label>}
+
+          {emailVerificationRequired && <label className="login-field">
+            <span>邮箱验证码<em>*</em></span>
+            <input
+              value={signUpEmailCode}
+              onChange={(event) =>
+                setSignUpEmailCode(event.target.value.replace(/\D/g, "").slice(0, 6))
+              }
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              placeholder="邮件里的 6 位数字"
+              required
+            />
+          </label>}
+
+          <label className="login-field">
+            <span>验证码<em>*</em></span>
+            <span className="login-inline">
+              <input
+                value={captchaAnswer}
+                onChange={(event) => setCaptchaAnswer(event.target.value)}
+                inputMode="numeric"
+                placeholder="填入计算结果"
+                required
+              />
+              <button
+                type="button"
+                className="login-captcha"
+                onClick={() => void refreshCaptcha()}
+                title="点一下换一道题"
+              >
+                {captcha ? captcha.question : "加载中…"}
+              </button>
+            </span>
+            {captchaError && <em className="login-field-error">{captchaError}</em>}
+          </label>
+
+          {emailNotice && <em className="login-field-hint">{emailNotice}</em>}
+
+          {/* 蜜罐：真人看不见（视觉隐藏 + 不进 Tab 顺序），机器人常照填 → 服务端据此拒绝。
+              故意不用 display:none —— 一部分脚本会跳过不可见的元素，那就白设了。 */}
+          <div className="login-honeypot" aria-hidden="true">
+            <label>
+              公司网址
+              <input
+                tabIndex={-1}
+                autoComplete="off"
+                value={signUpWebsite}
+                onChange={(event) => setSignUpWebsite(event.target.value)}
+              />
+            </label>
+          </div>
 
           {error && <p className="login-error" role="alert"><Warning />{error}</p>}
           {notice && <p className="login-notice" role="status"><CheckCircle weight="fill" />{notice}</p>}

@@ -1,219 +1,195 @@
 "use client";
 
 import { ArrowsClockwise } from "@phosphor-icons/react/dist/csr/ArrowsClockwise";
-import { Buildings } from "@phosphor-icons/react/dist/csr/Buildings";
 import { CheckCircle } from "@phosphor-icons/react/dist/csr/CheckCircle";
-import { EnvelopeSimple } from "@phosphor-icons/react/dist/csr/EnvelopeSimple";
 import { Prohibit } from "@phosphor-icons/react/dist/csr/Prohibit";
-import { Trash } from "@phosphor-icons/react/dist/csr/Trash";
+import { ShieldCheck } from "@phosphor-icons/react/dist/csr/ShieldCheck";
 import { UserCircle } from "@phosphor-icons/react/dist/csr/UserCircle";
-import { UserPlus } from "@phosphor-icons/react/dist/csr/UserPlus";
-import { useMemo, useState } from "react";
+import { Warning } from "@phosphor-icons/react/dist/csr/Warning";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch, apiUrl, toErrorMessage } from "../../auth/api";
 import { WorkspacePage } from "../ui/shell";
 import {
-  Card, ConfirmDialog, Field, FilterChips, FormGrid, LoadingState, Modal, Pill,
-  ProgressMeter, SampleBanner, SearchField, SelectInput, StatStrip, SwitchRow, TextInput, Toolbar, useNotice,
+  Card, ErrorState, FilterChips, LoadingState, Pill, SampleBanner, SearchField,
+  SelectInput, StatStrip, Toolbar,
 } from "../ui/primitives";
-import { DataTable, IconButton, RowActions, type Column } from "../ui/table";
-import { useCollection } from "../ui/store";
-import { formatDateTime, memberSeeds, roleLabels, rolePermissions, tenantSeeds, type Member, type MemberRole } from "../ui/data";
+import { DataTable, type Column } from "../ui/table";
+import { formatDateTime } from "../ui/data";
 
-type RoleFilter = "all" | MemberRole;
-type StatusFilter = "all" | Member["status"];
-
-const statusMeta: Record<Member["status"], { label: string; tone: "ok" | "warn" | "danger" }> = {
-  active: { label: "正常", tone: "ok" },
-  invited: { label: "待接受邀请", tone: "warn" },
-  suspended: { label: "已停用", tone: "danger" },
+/* 成员来自真实 users 表（GET /api/members）。后端没有成员的新增 / 改角色 / 删除
+   接口，所以这一页是只读的：不提供任何会写入本地的按钮。 */
+type Member = {
+  user_id: string;
+  username: string;
+  display_name: string;
+  role: string;
+  must_change_password: boolean;
+  disabled: boolean;
+  last_login_at: string;
+  created_at: string;
 };
 
-const planLabels: Record<string, string> = { free: "免费版", team: "团队版", enterprise: "企业版", trial: "试用中" };
+type RoleMeta = { role: string; label: string; scopes: string[] };
 
-/* 租户与成员: 工作区的组织边界。角色决定能改什么配置、能否审批高风险动作 ——
-   这里的设置会直接约束运行中心的审批入口出现与否。 */
-export default function TenantsPage() {
-  const { items, ready, create, update, remove } = useCollection<Member>("members", memberSeeds);
-  const { notice, push, clear } = useNotice();
+type MembersPayload = {
+  members: Member[];
+  roles: RoleMeta[];
+  note: string;
+};
 
-  const [tenantId, setTenantId] = useState("all");
+/* 后端返回的作用域是机器可读的 key，这里只做展示翻译，未命中就原样显示。 */
+const scopeLabels: Record<string, string> = {
+  workspace: "工作区配置",
+  agents: "Agent 与工具配置",
+  governance: "治理与审批",
+  runtime: "运行中心",
+};
+
+type StatusFilter = "all" | "active" | "pending" | "disabled";
+
+/* 成员与角色：后端账号体系的只读视图。角色字段已入库，但还没有接到页面级
+   授权上 —— 这一点由后端返回的 note 直接摆在页面上，不做任何粉饰。 */
+export default function MembersPage() {
+  const [members, setMembers] = useState<Member[]>([]);
+  const [roles, setRoles] = useState<RoleMeta[]>([]);
+  const [note, setNote] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState("");
+
   const [query, setQuery] = useState("");
-  const [role, setRole] = useState<RoleFilter>("all");
+  const [role, setRole] = useState("all");
   const [status, setStatus] = useState<StatusFilter>("all");
-  const [inviteOpen, setInviteOpen] = useState(false);
-  const [invite, setInvite] = useState({ name: "", email: "", role: "builder" as MemberRole, tenantId: tenantSeeds[0].id, tenantWide: true });
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [pendingDelete, setPendingDelete] = useState<Member | null>(null);
+
+  const load = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const response = await apiFetch(apiUrl("/api/members"));
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(toErrorMessage(payload, "无法读取成员列表"));
+      }
+      const payload = (await response.json()) as MembersPayload;
+      setMembers(payload.members ?? []);
+      setRoles(payload.roles ?? []);
+      setNote(payload.note ?? "");
+      setLoadError("");
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "无法读取成员列表，请确认后端已启动。");
+    } finally {
+      setLoaded(true);
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const roleMeta = useMemo(
+    () => new Map(roles.map((item) => [item.role, item.label])),
+    [roles],
+  );
 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLowerCase();
-    return items.filter((item) => {
-      if (tenantId !== "all" && item.tenantId !== tenantId) return false;
+    return members.filter((item) => {
       if (role !== "all" && item.role !== role) return false;
-      if (status !== "all" && item.status !== status) return false;
+      if (status === "active" && (item.disabled || item.must_change_password)) return false;
+      if (status === "pending" && !item.must_change_password) return false;
+      if (status === "disabled" && !item.disabled) return false;
       if (!keyword) return true;
-      return item.name.toLowerCase().includes(keyword) || item.email.toLowerCase().includes(keyword);
+      return item.display_name.toLowerCase().includes(keyword)
+        || item.username.toLowerCase().includes(keyword);
     });
-  }, [items, query, role, status, tenantId]);
-
-  const tenants = tenantSeeds.map((tenant) => ({
-    ...tenant,
-    usedSeats: items.filter((item) => item.tenantId === tenant.id).length,
-  }));
+  }, [members, query, role, status]);
 
   const metrics = [
-    { label: "租户", value: tenantSeeds.length, note: `${tenants.filter((item) => item.status === "trial").length} 个试用中`, icon: Buildings },
-    { label: "成员", value: items.length, note: `${items.filter((item) => item.status === "active").length} 人正常`, icon: UserCircle },
-    { label: "席位占用", value: `${items.length} / ${tenants.reduce((sum, item) => sum + item.seats, 0)}`, note: "跨全部租户", icon: CheckCircle },
-    { label: "待处理", value: items.filter((item) => item.status === "invited").length, note: "已邀请未接受", icon: EnvelopeSimple },
+    { label: "成员", value: members.length, note: "来自 users 表", icon: UserCircle },
+    {
+      label: "管理员",
+      value: members.filter((item) => item.role === "admin").length,
+      note: roleMeta.get("admin") ?? "admin",
+      icon: ShieldCheck,
+    },
+    { label: "待改初始密码", value: members.filter((item) => item.must_change_password).length, note: "首次登录后应尽快修改", icon: Warning },
+    { label: "已停用", value: members.filter((item) => item.disabled).length, note: "无法登录", icon: Prohibit },
   ];
-
-  function submitInvite() {
-    const next: Record<string, string> = {};
-    if (!invite.name.trim()) next.name = "请填写成员姓名";
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(invite.email.trim())) next.email = "请输入有效的邮箱地址";
-    else if (items.some((item) => item.email.toLowerCase() === invite.email.trim().toLowerCase())) next.email = "该邮箱已在成员列表中";
-    setErrors(next);
-    if (Object.keys(next).length) return;
-
-    create({
-      name: invite.name.trim(),
-      email: invite.email.trim(),
-      role: invite.role,
-      status: "invited",
-      tenantId: invite.tenantId,
-      lastActiveAt: null,
-      joinedAt: new Date().toISOString(),
-      approvals: 0,
-      tasks: 0,
-    });
-    push(`已向 ${invite.email} 发送邀请`);
-    setInviteOpen(false);
-    setInvite({ name: "", email: "", role: "builder", tenantId: tenantSeeds[0].id, tenantWide: true });
-  }
 
   const columns: Array<Column<Member>> = [
     {
       key: "name",
       header: "成员",
-      sortValue: (row) => row.name,
+      sortValue: (row) => row.display_name || row.username,
       render: (row) => <span className="cell-title with-icon">
-        <i className="avatar-badge">{row.name.slice(0, 1)}</i>
-        <span><strong>{row.name}</strong><small>{row.email}</small></span>
+        <i className="avatar-badge">{(row.display_name || row.username).slice(0, 1)}</i>
+        <span>
+          <strong>{row.display_name || row.username}</strong>
+          <small className="mono">{row.username}</small>
+        </span>
       </span>,
     },
     {
       key: "role",
       header: "角色",
       sortValue: (row) => row.role,
-      render: (row) => <SelectInput
-        value={row.role}
-        onChange={(value) => {
-          update(row.id, { role: value });
-          push(`已将 ${row.name} 的角色改为${roleLabels[value]}`);
-        }}
-        options={(Object.keys(roleLabels) as MemberRole[]).map((item) => ({ value: item, label: roleLabels[item] }))}
-      />,
-    },
-    {
-      key: "tenantId",
-      header: "所属租户",
-      secondary: true,
-      sortValue: (row) => row.tenantId,
-      render: (row) => tenantSeeds.find((item) => item.id === row.tenantId)?.name ?? row.tenantId,
+      render: (row) => <Pill tone={row.role === "admin" ? "accent" : "neutral"}>{roleMeta.get(row.role) ?? row.role}</Pill>,
     },
     {
       key: "status",
       header: "状态",
-      sortValue: (row) => row.status,
-      render: (row) => <Pill tone={statusMeta[row.status].tone}>{statusMeta[row.status].label}</Pill>,
+      sortValue: (row) => (row.disabled ? "2" : row.must_change_password ? "1" : "0"),
+      render: (row) => <span className="cell-stack">
+        <Pill tone={row.disabled ? "danger" : row.must_change_password ? "warn" : "ok"}>
+          {row.disabled ? "已停用" : row.must_change_password ? "待改初始密码" : "正常"}
+        </Pill>
+      </span>,
     },
     {
-      key: "lastActiveAt",
-      header: "最近活跃",
+      key: "last_login_at",
+      header: "最近登录",
+      sortValue: (row) => row.last_login_at,
+      render: (row) => row.last_login_at
+        ? formatDateTime(row.last_login_at)
+        : <span className="muted-text">尚未登录过</span>,
+    },
+    {
+      key: "created_at",
+      header: "创建时间",
       secondary: true,
-      sortValue: (row) => row.lastActiveAt ?? "",
-      render: (row) => <span className="cell-stack"><strong>{formatDateTime(row.lastActiveAt)}</strong><small>加入于 {formatDateTime(row.joinedAt)}</small></span>,
+      sortValue: (row) => row.created_at,
+      render: (row) => formatDateTime(row.created_at),
     },
     {
-      key: "stats",
-      header: "审批 / 任务",
-      align: "right",
+      key: "user_id",
+      header: "用户 ID",
       secondary: true,
-      sortValue: (row) => row.tasks,
-      render: (row) => <span className="cell-stack right"><strong>{row.approvals} / {row.tasks}</strong><small>累计</small></span>,
-    },
-    {
-      key: "actions",
-      header: "操作",
-      align: "right",
-      render: (row) => <RowActions>
-        <IconButton
-          icon={row.status === "suspended" ? CheckCircle : Prohibit}
-          label={row.status === "suspended" ? "恢复成员" : "停用成员"}
-          onClick={() => {
-            const next = row.status === "suspended" ? "active" : "suspended";
-            update(row.id, { status: next });
-            push(next === "active" ? `已恢复 ${row.name}` : `已停用 ${row.name}`);
-          }}
-        />
-        <IconButton icon={Trash} label="移除成员" tone="danger" onClick={() => setPendingDelete(row)} />
-      </RowActions>,
+      sortValue: (row) => row.user_id,
+      render: (row) => <span className="mono">{row.user_id}</span>,
     },
   ];
 
   return <WorkspacePage
     active="tenants"
-    note="工作区的组织边界：租户、席位与角色。角色决定成员能修改哪些配置、能否审批高风险动作，因此这里的改动会直接反映到运行中心的审批入口。"
-    notice={notice}
-    onDismissNotice={clear}
-    actions={<>
-      <button type="button" onClick={() => push("成员列表已刷新（示例数据）", "info")}><ArrowsClockwise />刷新</button>
-      <button type="button" className="save action-btn" onClick={() => { setErrors({}); setInviteOpen(true); }}><UserPlus />邀请成员</button>
-    </>}
+    note="工作区账号的只读视图：成员直接来自后端 users 表，包含角色、是否仍在使用初始密码以及最近登录时间。后端暂未提供成员的新增、改角色与删除接口，因此这里不做任何写入。"
+    actions={<button type="button" onClick={() => void load()} disabled={refreshing}>
+      <ArrowsClockwise className={refreshing ? "spin" : undefined} />{refreshing ? "同步中…" : "刷新"}
+    </button>}
   >
-    <SampleBanner note="租户与成员尚未接入后端账号体系，角色与状态保存在浏览器本地存储中。" />
+    {note && <p className="detail-note"><Warning />{note}</p>}
 
     <StatStrip items={metrics} />
 
     <Card
-      icon={Buildings}
-      title="租户"
-      note="点击卡片筛选该租户的成员"
-      action={<SelectInput
-        value={tenantId}
-        onChange={setTenantId}
-        options={[{ value: "all", label: "全部租户" }, ...tenantSeeds.map((item) => ({ value: item.id, label: item.name }))]}
-      />}
-    >
-      <div className="tenant-grid">
-        {tenants.map((tenant) => <article key={tenant.id} className={`tenant-card ${tenantId === tenant.id ? "active" : ""}`}>
-          <button type="button" onClick={() => setTenantId(tenantId === tenant.id ? "all" : tenant.id)}>
-            <header>
-              <span className="tenant-mark"><Buildings weight="duotone" /></span>
-              <div><strong>{tenant.name}</strong><small>{tenant.region} · 创建于 {formatDateTime(tenant.createdAt)}</small></div>
-              <Pill tone={tenant.status === "trial" ? "warn" : "ok"}>{planLabels[tenant.plan]}</Pill>
-            </header>
-            <div className="tenant-seats">
-              <span>席位 {tenant.usedSeats} / {tenant.seats}</span>
-              <ProgressMeter value={tenant.usedSeats} max={tenant.seats} tone={tenant.usedSeats >= tenant.seats ? "danger" : "ok"} compact />
-            </div>
-          </button>
-        </article>)}
-      </div>
-    </Card>
-
-    <Card
       icon={UserCircle}
       title="成员列表"
-      note="角色可直接在行内调整，变更会立即生效"
+      note="只读：按姓名、用户名或角色筛选"
       count={filtered.length}
       toolbar={<Toolbar>
-        <SearchField value={query} onChange={setQuery} placeholder="搜索姓名或邮箱" />
+        <SearchField value={query} onChange={setQuery} placeholder="搜索姓名或用户名" />
         <div className="toolbar-filters">
           <SelectInput
             value={role}
             onChange={setRole}
-            options={[{ value: "all", label: "全部角色" }, ...(Object.keys(roleLabels) as MemberRole[]).map((item) => ({ value: item, label: roleLabels[item] }))]}
+            options={[{ value: "all", label: "全部角色" }, ...roles.map((item) => ({ value: item.role, label: item.label }))]}
           />
           <FilterChips<StatusFilter>
             value={status}
@@ -221,88 +197,53 @@ export default function TenantsPage() {
             options={[
               { id: "all", label: "全部" },
               { id: "active", label: "正常" },
-              { id: "invited", label: "待接受" },
-              { id: "suspended", label: "已停用" },
+              { id: "pending", label: "待改密码" },
+              { id: "disabled", label: "已停用" },
             ]}
+            counts={{
+              all: members.length,
+              active: members.filter((item) => !item.disabled && !item.must_change_password).length,
+              pending: members.filter((item) => item.must_change_password).length,
+              disabled: members.filter((item) => item.disabled).length,
+            }}
           />
         </div>
       </Toolbar>}
     >
-      {!ready
+      {!loaded
         ? <LoadingState label="正在读取成员列表…" />
-        : <DataTable<Member>
-          columns={columns}
-          rows={filtered}
-          rowKey={(row) => row.id}
-          pageSize={8}
-          emptyTitle={items.length ? "没有匹配的成员" : "该工作区还没有成员"}
-          emptyNote={items.length ? "试着清空搜索或更换筛选条件。" : "邀请第一位成员加入工作区。"}
-          emptyAction={items.length
-            ? <button type="button" className="ghost-action" onClick={() => { setQuery(""); setRole("all"); setStatus("all"); setTenantId("all"); }}>清除筛选</button>
-            : <button type="button" className="primary-action action-btn" onClick={() => setInviteOpen(true)}><UserPlus />邀请成员</button>}
-        />}
+        : loadError
+          ? <ErrorState message={loadError} onRetry={() => void load()} />
+          : <DataTable<Member>
+            columns={columns}
+            rows={filtered}
+            rowKey={(row) => row.user_id}
+            pageSize={8}
+            emptyTitle={members.length ? "没有匹配的成员" : "还没有成员"}
+            emptyNote={members.length ? "试着清空搜索或更换筛选条件。" : "账号体系中还没有任何用户记录。"}
+            emptyAction={members.length
+              ? <button type="button" className="ghost-action" onClick={() => { setQuery(""); setRole("all"); setStatus("all"); }}>清除筛选</button>
+              : undefined}
+          />}
     </Card>
 
-    <Card icon={CheckCircle} title="角色权限矩阵" note="所有角色都必须遵守工具级权限与审计，矩阵只描述配置与审批范围">
+    <SampleBanner note="下方角色作用域矩阵属于规划信息：后端目前只返回角色定义与作用域清单，尚未用于页面级授权 —— 现在的页面不会因为角色不同而隐藏入口或拦截操作。" />
+
+    <Card
+      icon={ShieldCheck}
+      title="角色作用域（规划中，尚未生效）"
+      note="后端 /api/members 返回的 roles 字段，当前只做展示"
+    >
       <div className="permission-grid">
-        {rolePermissions.map((entry) => <article key={entry.role}>
-          <header><strong>{roleLabels[entry.role]}</strong><Pill tone="neutral">{items.filter((item) => item.role === entry.role).length} 人</Pill></header>
-          <ul>{entry.scopes.map((scope) => <li key={scope}><CheckCircle weight="fill" />{scope}</li>)}</ul>
+        {roles.map((entry) => <article key={entry.role}>
+          <header>
+            <strong>{entry.label}</strong>
+            <Pill tone="neutral">{members.filter((item) => item.role === entry.role).length} 人</Pill>
+          </header>
+          <ul>{entry.scopes.map((scope) => <li key={scope}><CheckCircle weight="fill" />{scopeLabels[scope] ?? scope}</li>)}</ul>
         </article>)}
       </div>
+      {!roles.length && <p className="detail-note">后端还没有返回任何角色定义。</p>}
     </Card>
-
-    <Modal
-      open={inviteOpen}
-      onClose={() => setInviteOpen(false)}
-      title="邀请成员"
-      description="被邀请人会收到一封邮件，接受后按所选角色加入。"
-      footer={<>
-        <button type="button" className="ghost-action" onClick={() => setInviteOpen(false)}>取消</button>
-        <button type="button" className="primary-action action-btn" onClick={submitInvite}>发送邀请</button>
-      </>}
-    >
-      <FormGrid>
-        <Field label="姓名" required error={errors.name}>
-          <TextInput value={invite.name} onChange={(value) => setInvite((current) => ({ ...current, name: value }))} placeholder="例如：徐汀" invalid={Boolean(errors.name)} />
-        </Field>
-        <Field label="邮箱" required error={errors.email}>
-          <TextInput value={invite.email} onChange={(value) => setInvite((current) => ({ ...current, email: value }))} placeholder="name@example.com" invalid={Boolean(errors.email)} />
-        </Field>
-        <Field label="角色" hint={rolePermissions.find((item) => item.role === invite.role)?.scopes.join("、")}>
-          <SelectInput
-            value={invite.role}
-            onChange={(value) => setInvite((current) => ({ ...current, role: value }))}
-            options={(Object.keys(roleLabels) as MemberRole[]).map((item) => ({ value: item, label: roleLabels[item] }))}
-          />
-        </Field>
-        <Field label="所属租户">
-          <SelectInput
-            value={invite.tenantId}
-            onChange={(value) => setInvite((current) => ({ ...current, tenantId: value }))}
-            options={tenantSeeds.map((item) => ({ value: item.id, label: item.name }))}
-          />
-        </Field>
-      </FormGrid>
-      <SwitchRow
-        title="同时授予工作区默认配置的查看权限"
-        note="仅影响只读范围，不会授予审批权"
-        checked={invite.tenantWide}
-        onChange={(value) => setInvite((current) => ({ ...current, tenantWide: value }))}
-      />
-    </Modal>
-
-    <ConfirmDialog
-      open={Boolean(pendingDelete)}
-      title="移除成员"
-      message={pendingDelete ? `${pendingDelete.name}（${pendingDelete.email}）将失去该工作区的全部访问权限。` : ""}
-      confirmLabel="确认移除"
-      onConfirm={() => {
-        if (!pendingDelete) return;
-        remove(pendingDelete.id);
-        push(`已移除 ${pendingDelete.name}`);
-      }}
-      onClose={() => setPendingDelete(null)}
-    />
   </WorkspacePage>;
 }

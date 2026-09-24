@@ -16,12 +16,10 @@ from __future__ import annotations
 
 import json
 import secrets
-import socket
 import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
-from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -31,12 +29,22 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from apps.api.auth import Account, current_user
 from apps.api.settings import settings
 from packages.contracts.models import McpServerDraft, McpServerView
+from packages.general_agent.mcp_client import (
+    CLIENT_INFO,
+    PROTOCOL_VERSION,
+    McpRpcError,
+    jsonrpc,
+    normalize_tools,
+    rpc_error_message,
+)
+from packages.general_agent.mcp_client import (
+    parse_rpc_response as parse_rpc_payload,
+)
+from packages.general_agent.net import http_trust_env_for, is_private_host
 
 PROBE_TIMEOUT_SECONDS = 8.0
 # 探测回来的响应体上限：MCP 服务端返回超大 JSON 时不要把它读进内存
 MAX_PROBE_BYTES = 512 * 1024
-CLIENT_INFO = {"name": "nexus-agent", "version": "0.1.0"}
-PROTOCOL_VERSION = "2025-06-18"
 
 PROBE_NEVER = "never"
 PROBE_OK = "ok"
@@ -61,20 +69,12 @@ class ProbeResult:
     latency_ms: int = 0
 
 
-def is_private_host(host: str) -> bool:
-    """回环 / 私有网段 / 链路本地都算内网。解析失败时按内网处理（宁可拦错）。"""
-    if not host:
-        return True
+def parse_rpc_response(response: httpx.Response) -> dict[str, object]:
+    """对外契约保持为 McpError（带状态码），内部实现共用 packages 的解析器。"""
     try:
-        address = ip_address(host)
-    except ValueError:
-        try:
-            address = ip_address(socket.gethostbyname(host))
-        except (OSError, ValueError):
-            return True
-    return (
-        address.is_private or address.is_loopback or address.is_link_local or address.is_reserved
-    )
+        return parse_rpc_payload(response)
+    except McpRpcError as exc:
+        raise McpError(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
 
 
 def validate_endpoint(url: str) -> str:
@@ -91,70 +91,6 @@ def validate_endpoint(url: str) -> str:
     return url.strip()
 
 
-def _jsonrpc(
-    method: str, request_id: int | None, params: dict[str, object] | None = None
-) -> dict[str, object]:
-    payload: dict[str, object] = {"jsonrpc": "2.0", "method": method}
-    if request_id is not None:
-        payload["id"] = request_id
-    if params is not None:
-        payload["params"] = params
-    return payload
-
-
-def parse_rpc_response(response: httpx.Response) -> dict[str, object]:
-    """Streamable HTTP 可能直接回 JSON，也可能回 SSE —— 两种都要认。"""
-    content_type = response.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
-        for line in response.text.splitlines():
-            if not line.startswith("data:"):
-                continue
-            try:
-                payload = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict) and ("result" in payload or "error" in payload):
-                return payload
-        raise McpError(status.HTTP_502_BAD_GATEWAY, "SSE 响应里没有可解析的 JSON-RPC 结果")
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise McpError(status.HTTP_502_BAD_GATEWAY, "服务端没有返回 JSON-RPC") from exc
-    if not isinstance(payload, dict):
-        raise McpError(status.HTTP_502_BAD_GATEWAY, "JSON-RPC 响应不是对象")
-    return payload
-
-
-def rpc_error_message(payload: dict[str, object]) -> str:
-    error = payload.get("error")
-    if isinstance(error, dict):
-        return str(error.get("message") or error)
-    return ""
-
-
-def normalize_tools(payload: dict[str, object]) -> list[dict[str, object]]:
-    result = payload.get("result")
-    raw_tools = result.get("tools") if isinstance(result, dict) else None
-    if not isinstance(raw_tools, list):
-        return []
-    tools: list[dict[str, object]] = []
-    for item in raw_tools[:50]:
-        if not isinstance(item, dict):
-            continue
-        annotations = item.get("annotations")
-        read_only = (
-            bool(annotations.get("readOnlyHint")) if isinstance(annotations, dict) else False
-        )
-        tools.append(
-            {
-                "name": str(item.get("name") or ""),
-                "description": str(item.get("description") or "")[:300],
-                "access": "read" if read_only else "write",
-            }
-        )
-    return tools
-
-
 async def probe_http_server(endpoint: str, token: str = "") -> ProbeResult:
     """真实握手：initialize → notifications/initialized → tools/list。"""
     headers = {
@@ -165,11 +101,13 @@ async def probe_http_server(endpoint: str, token: str = "") -> ProbeResult:
         headers["Authorization"] = f"Bearer {token}"
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(
+                timeout=PROBE_TIMEOUT_SECONDS, trust_env=http_trust_env_for(endpoint)
+            ) as client:
             handshake = await client.post(
                 endpoint,
                 headers=headers,
-                json=_jsonrpc(
+                json=jsonrpc(
                     "initialize",
                     1,
                     {
@@ -202,19 +140,21 @@ async def probe_http_server(endpoint: str, token: str = "") -> ProbeResult:
             await client.post(
                 endpoint,
                 headers=session_headers,
-                json=_jsonrpc("notifications/initialized", None, {}),
+                json=jsonrpc("notifications/initialized", None, {}),
             )
 
             listing = await client.post(
-                endpoint, headers=session_headers, json=_jsonrpc("tools/list", 2, {})
+                endpoint, headers=session_headers, json=jsonrpc("tools/list", 2, {})
             )
             tools: list[dict[str, object]] = []
             if listing.status_code < 400 and len(listing.content) <= MAX_PROBE_BYTES:
-                tools = normalize_tools(parse_rpc_response(listing))
+                tools = normalize_tools(parse_rpc_response(listing), with_schema=True)
     except httpx.HTTPError as exc:
         return ProbeResult(PROBE_FAILED, f"无法连接：{type(exc).__name__}")
     except McpError as exc:
         return ProbeResult(PROBE_FAILED, exc.detail)
+    except McpRpcError as exc:
+        return ProbeResult(PROBE_FAILED, str(exc))
 
     latency = int((time.perf_counter() - started) * 1000)
     label = f"{server_name} {server_version}".strip() or "未自报名称"
@@ -231,6 +171,9 @@ async def probe_http_server(endpoint: str, token: str = "") -> ProbeResult:
 class McpStore:
     def __init__(self, database_path: Path) -> None:
         self.path = database_path.resolve()
+        # 与 TaskStore / AuthStore 一致：自建父目录，否则全新的部署目录里
+        # 启动会因为 data/ 不存在而打不开库（导入顺序决定谁先碰库，不能靠别人）。
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def list(self) -> list[dict[str, object]]:

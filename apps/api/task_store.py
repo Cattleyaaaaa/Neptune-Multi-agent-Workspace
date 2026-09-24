@@ -20,8 +20,12 @@ class TaskStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def save_task(self, state: GeneralTaskState) -> str:
-        """Persist a task and return the timestamp the database recorded."""
+    def save_task(self, state: GeneralTaskState, owner_id: str | None = None) -> str:
+        """Persist a task and return the timestamp the database recorded.
+
+        `owner_id` 只在创建时给；后续更新不传时用 COALESCE 保留原值，
+        否则每次 _persist 都会把归属抹成 NULL。
+        """
         # The timestamp is owned by the database, so it must not be baked into
         # the payload that gets replayed on the next write.
         payload = json.dumps(
@@ -31,13 +35,14 @@ class TaskStore:
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
-                INSERT INTO tasks (task_id, payload, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO tasks (task_id, payload, owner_id, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(task_id) DO UPDATE SET
                     payload = excluded.payload,
+                    owner_id = COALESCE(excluded.owner_id, tasks.owner_id),
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (state["task_id"], payload),
+                (state["task_id"], payload, owner_id),
             )
             row = connection.execute(
                 "SELECT updated_at FROM tasks WHERE task_id = ?", (state["task_id"],)
@@ -56,6 +61,12 @@ class TaskStore:
             )
             for row in rows
         }
+
+    def load_task_owners(self) -> dict[str, str | None]:
+        """任务 → 归属人。NULL 表示历史数据（改造前创建的），按"无归属"处理。"""
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT task_id, owner_id FROM tasks").fetchall()
+        return {row["task_id"]: row["owner_id"] for row in rows}
 
     def append_event(self, task_id: str, name: str, data: dict[str, object]) -> None:
         with closing(self._connect()) as connection, connection:
@@ -125,6 +136,10 @@ class TaskStore:
                 );
                 """
             )
+            # 迁移：老库的 tasks 表没有 owner_id，补上后历史任务为 NULL。
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+            if "owner_id" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN owner_id TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)

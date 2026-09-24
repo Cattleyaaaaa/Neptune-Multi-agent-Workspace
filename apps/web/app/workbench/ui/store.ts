@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const PREFIX = "nexus.workbench.v1.";
+const PREFIX = "neptune.workbench.v1.";
 
 function storageKey(key: string) {
   return `${PREFIX}${key}`;

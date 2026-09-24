@@ -203,7 +203,7 @@ async def test_probe_performs_a_real_handshake(stub_server: str) -> None:
     assert "tools/list" in methods
     # 初始化必须带上客户端信息与协议版本
     initialize = _StubHandler.received[0]
-    assert initialize["params"]["clientInfo"]["name"] == "nexus-agent"
+    assert initialize["params"]["clientInfo"]["name"] == "neptune-agent"
 
 
 @pytest.mark.asyncio
@@ -297,3 +297,33 @@ def test_stdio_probe_is_marked_unsupported() -> None:
 
     result = ProbeResult(PROBE_UNSUPPORTED, "stdio / sse 传输不支持在服务端探测")
     assert result.status == "unsupported"
+
+
+# ---------------------------------------------------------- 系统代理不能拦内网
+
+
+def test_private_endpoints_bypass_the_system_proxy() -> None:
+    """内网端点必须直连。Windows 注册表里的系统代理会被 httpx 读到，
+    而注册表的「本地地址绕过」列表它并不认 —— 本机代理会把 127.0.0.1 的探测转成 502。"""
+    from packages.general_agent.net import http_trust_env_for
+
+    assert http_trust_env_for("http://127.0.0.1:8000/mcp") is False
+    assert http_trust_env_for("http://localhost:8000/mcp") is False
+    assert http_trust_env_for("http://10.0.0.5:3000/mcp") is False
+    assert http_trust_env_for("http://192.168.1.9/mcp") is False
+    # 公网端点仍尊重代理（有些部署要靠代理出网）
+    assert http_trust_env_for("https://mcp.example.com/mcp") is True
+
+
+@pytest.mark.asyncio
+async def test_probe_survives_a_broken_proxy(
+    stub_server: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """把代理环境变量指到一个死端口，本机探测仍须成功 —— 证明它真的没走代理。"""
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
+
+    result = await probe_http_server(stub_server)
+
+    assert result.status == PROBE_OK, result.detail
+    assert result.server_name == "stub-mcp"

@@ -173,6 +173,9 @@ class SkillStore:
     def __init__(self, database_path: Path, files_dir: Path) -> None:
         self.path = database_path.resolve()
         self.files_dir = files_dir.resolve()
+        # 库的父目录与技能文件目录都要自建：全新目录里谁先被实例化取决于导入顺序，
+        # 不能指望别处先替它建好（缺这行时新服务器上会启动即崩）。
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.files_dir.mkdir(parents=True, exist_ok=True)
         self._initialize()
 

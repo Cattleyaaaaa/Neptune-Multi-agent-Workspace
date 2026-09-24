@@ -20,6 +20,7 @@ logout and "log out everywhere" actually mean something.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import secrets
@@ -29,15 +30,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from fastapi.security.utils import get_authorization_scheme_param
 
 from apps.api.auth_store import (
     JWT_SECRET_NAME,
     ROLE_ADMIN,
+    ROLE_GUEST,
     ROLE_MEMBER,
     AuthStore,
     epoch_to_iso,
 )
+from apps.api.mailer import MailNotConfiguredError, send_email_code
 from apps.api.security import (
     TOKEN_TYPE_ACCESS,
     TOKEN_TYPE_REFRESH,
@@ -51,7 +55,9 @@ from apps.api.security import (
 )
 from apps.api.settings import settings
 from packages.contracts.models import (
+    CaptchaView,
     ChangePasswordRequest,
+    EmailCodeRequest,
     LoginRequest,
     MeView,
     RefreshRequest,
@@ -62,9 +68,15 @@ from packages.contracts.models import (
     UserView,
 )
 
-logger = logging.getLogger("nexus.auth")
+logger = logging.getLogger("neptune.auth")
 
 DEFAULT_ADMIN_PASSWORD = "admin123"
+# 访客是共享的只读账号：所有访客共用它，因此会话列表里能看到彼此。
+GUEST_USERNAME = "guest"
+GUEST_DISPLAY_NAME = "访客"
+# 一次性校验凭据的类型（auth_challenges.kind）
+CHALLENGE_CAPTCHA = "captcha"
+CHALLENGE_EMAIL = "email_code"
 _VALID_SAMESITE = {"lax", "strict", "none"}
 # HS256 的密钥强度就是签名的全部强度，短密钥等于没有签名。
 MIN_SECRET_LENGTH = 32
@@ -197,6 +209,160 @@ class AuthService:
             client_ip=client_ip,
         )
 
+    # ------------------------------------------------------------ 注册端校验
+    # 四道防线的强度不一样，别把它们说成同一回事：
+    #   蜜罐 / 填写时长  → 挡最廉价的批量脚本，成本很低但可被绕过（所以只作为其中一层）；
+    #   图形验证码       → 强制，一次一用、错够次数作废；
+    #   邮箱验证码       → 只在配置了 SMTP 时强制，否则退回"邮箱格式 + 唯一性"。
+
+    def issue_captcha(self) -> tuple[str, str]:
+        """出一道算术题。答案只存哈希：短时有效、一次一用、错够次数作废。"""
+        left = secrets.randbelow(9) + 2  # 2..10
+        right = secrets.randbelow(9) + 1  # 1..9
+        challenge_id = f"cap_{secrets.token_hex(12)}"
+        now = int(time.time())
+        self.store.create_challenge(
+            challenge_id=challenge_id,
+            kind=CHALLENGE_CAPTCHA,
+            target="",
+            secret_hash=hash_token(str(left + right)),
+            expires_at=now + settings.captcha_ttl_seconds,
+            now=now,
+        )
+        return challenge_id, f"{left} + {right} = ?"
+
+    def _consume_code(
+        self,
+        *,
+        row: dict[str, object] | None,
+        secret: str,
+        label: str,
+        max_attempts: int,
+    ) -> None:
+        """一次性凭据的通用校验：不存在 / 已用 / 过期 / 错太多次都不放行，通过后立刻消费。
+
+        先比对再消费的顺序很重要 —— 反过来会让一次错误输入就作废整张凭据。
+        """
+        now = int(time.time())
+        if row is None:
+            raise AuthError(status.HTTP_400_BAD_REQUEST, f"{label}无效，请重新获取")
+        challenge_id = str(row["challenge_id"])
+        if int(row["consumed_at"] or 0):
+            raise AuthError(status.HTTP_400_BAD_REQUEST, f"{label}已使用过，请重新获取")
+        if int(row["expires_at"]) <= now:
+            raise AuthError(status.HTTP_400_BAD_REQUEST, f"{label}已过期，请重新获取")
+        if int(row["attempts"] or 0) >= max_attempts:
+            raise AuthError(
+                status.HTTP_429_TOO_MANY_REQUESTS, f"{label}错误次数过多，请重新获取"
+            )
+        if not hmac.compare_digest(str(row["secret_hash"]), hash_token(secret)):
+            self.store.bump_challenge_attempts(challenge_id)
+            raise AuthError(status.HTTP_400_BAD_REQUEST, f"{label}不正确")
+        self.store.consume_challenge(challenge_id, now=now)
+
+    def verify_captcha(self, *, challenge_id: str, answer: str) -> None:
+        self._consume_code(
+            row=self.store.get_challenge(challenge_id) if challenge_id else None,
+            secret=answer.strip(),
+            label="验证码",
+            max_attempts=settings.captcha_max_attempts,
+        )
+
+    async def issue_email_code(self, email: str) -> int:
+        """发注册验证码，返回有效期秒数。未配置邮件服务时明确拒绝，不假装发过。"""
+        if not settings.smtp_configured():
+            raise AuthError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "未配置邮件服务，暂时无法发送验证码；请联系管理员开通账号",
+            )
+        normalized = email.strip().lower()
+        now = int(time.time())
+        if self.store.get_user_by_email(normalized) is not None:
+            raise AuthError(status.HTTP_409_CONFLICT, "该邮箱已注册，请直接登录")
+
+        last = self.store.last_challenge_at(kind=CHALLENGE_EMAIL, target=normalized)
+        if last and now - last < settings.email_code_resend_seconds:
+            wait = settings.email_code_resend_seconds - (now - last)
+            raise AuthError(
+                status.HTTP_429_TOO_MANY_REQUESTS, f"请 {wait} 秒后再重新获取", retry_after=wait
+            )
+        recent = self.store.count_recent_challenges(
+            kind=CHALLENGE_EMAIL, target=normalized, since=now - 3600
+        )
+        if recent >= settings.email_code_hourly_limit:
+            raise AuthError(
+                status.HTTP_429_TOO_MANY_REQUESTS, "该邮箱获取验证码过于频繁，请一小时后再试"
+            )
+
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        self.store.create_challenge(
+            challenge_id=f"eml_{secrets.token_hex(12)}",
+            kind=CHALLENGE_EMAIL,
+            target=normalized,
+            secret_hash=hash_token(code),
+            expires_at=now + settings.email_code_ttl_seconds,
+            now=now,
+        )
+        try:
+            # 发信是阻塞 IO，丢进线程，别卡住事件循环
+            await asyncio.to_thread(
+                send_email_code,
+                to=normalized,
+                code=code,
+                ttl_minutes=max(1, settings.email_code_ttl_seconds // 60),
+            )
+        except MailNotConfiguredError as exc:  # 上面已拦，这里只是兜底
+            raise AuthError(status.HTTP_503_SERVICE_UNAVAILABLE, "未配置邮件服务") from exc
+        except Exception as exc:
+            logger.warning("验证码邮件发送失败：%s", exc)
+            raise AuthError(
+                status.HTTP_502_BAD_GATEWAY, "验证码邮件发送失败，请稍后重试或联系管理员"
+            ) from exc
+        self.store.prune_challenges(before=now - 24 * 3600)
+        return settings.email_code_ttl_seconds
+
+    def _guard_registration(
+        self,
+        *,
+        website: str | None,
+        form_elapsed_ms: int,
+        captcha_id: str,
+        captcha_answer: str,
+        email: str | None,
+        email_code: str | None,
+        client_ip: str,
+    ) -> str | None:
+        """注册前的四道校验，返回归一化后的邮箱（没有则为 None）。"""
+        # ① 蜜罐：真人看不见这个字段，填了基本就是机器人
+        if (website or "").strip():
+            logger.warning("注册被蜜罐字段拦下：ip=%s", client_ip)
+            raise AuthError(status.HTTP_400_BAD_REQUEST, "注册信息校验未通过，请刷新页面重试")
+        # ② 填写时长
+        elapsed = form_elapsed_ms / 1000
+        if elapsed < settings.registration_min_seconds:
+            raise AuthError(status.HTTP_400_BAD_REQUEST, "提交得太快了，请稍后再试")
+        if elapsed > settings.registration_max_seconds:
+            raise AuthError(status.HTTP_400_BAD_REQUEST, "页面打开过久，请刷新后重试")
+        # ③ 图形验证码（强制）
+        self.verify_captcha(challenge_id=captcha_id, answer=captcha_answer)
+        # ④ 邮箱验证：配了邮件服务就强制；没配则退回格式 + 唯一性
+        normalized: str | None = None
+        if settings.smtp_configured():
+            if not email or not email_code:
+                raise AuthError(status.HTTP_400_BAD_REQUEST, "请先完成邮箱验证")
+            normalized = email.strip().lower()
+            self._consume_code(
+                row=self.store.latest_challenge(kind=CHALLENGE_EMAIL, target=normalized),
+                secret=email_code.strip(),
+                label="邮箱验证码",
+                max_attempts=settings.email_code_max_attempts,
+            )
+        elif email:
+            normalized = email.strip().lower()
+        if normalized and self.store.get_user_by_email(normalized) is not None:
+            raise AuthError(status.HTTP_409_CONFLICT, "该邮箱已注册，请直接登录")
+        return normalized
+
     def register(
         self,
         *,
@@ -205,15 +371,31 @@ class AuthService:
         display_name: str | None,
         user_agent: str,
         client_ip: str,
+        website: str | None = None,
+        form_elapsed_ms: int = 0,
+        captcha_id: str = "",
+        captcha_answer: str = "",
+        email: str | None = None,
+        email_code: str | None = None,
     ) -> TokenPair:
         """自助注册：永远只给 member 角色，管理员只能由播种或后台创建。
 
         注册成功即登录（返回双令牌），否则用户还得再输一次密码，没这个必要。
+        注册前先过四道防滥用校验（见 `_guard_registration`）。
         """
         if not settings.allow_registration:
             raise AuthError(
                 status.HTTP_403_FORBIDDEN, "当前环境未开放注册，请联系管理员创建账号"
             )
+        normalized_email = self._guard_registration(
+            website=website,
+            form_elapsed_ms=form_elapsed_ms,
+            captcha_id=captcha_id,
+            captcha_answer=captcha_answer,
+            email=email,
+            email_code=email_code,
+            client_ip=client_ip,
+        )
         try:
             self.store.create_user(
                 user_id=f"usr_{secrets.token_hex(8)}",
@@ -221,6 +403,7 @@ class AuthService:
                 display_name=(display_name or "").strip() or username,
                 role=ROLE_MEMBER,
                 password_hash=hash_password(password),
+                email=normalized_email,
             )
         except sqlite3.IntegrityError as exc:
             # 用户名唯一索引兜底：先查后建之间仍可能有并发注册
@@ -232,6 +415,44 @@ class AuthService:
         logger.info("新账号注册：%s（%s）", username, ROLE_MEMBER)
         return self._issue_pair(
             self._account(record), user_agent=user_agent, client_ip=client_ip
+        )
+
+    def ensure_guest(self) -> dict[str, object]:
+        """访客账号：首次使用时创建，之后复用同一个。
+
+        密码是不可用的随机串 —— 访客只能走 `POST /api/auth/guest`，不能用密码登录。
+        """
+        record = self.store.get_user_by_username(GUEST_USERNAME)
+        if record is not None:
+            return record
+        self.store.create_user(
+            user_id=f"usr-{secrets.token_hex(8)}",
+            username=GUEST_USERNAME,
+            display_name=GUEST_DISPLAY_NAME,
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            role=ROLE_GUEST,
+            must_change_password=False,
+        )
+        created = self.store.get_user_by_username(GUEST_USERNAME)
+        if created is None:  # 创建后必然可读，这里只是收窄类型
+            raise AuthError(status.HTTP_500_INTERNAL_SERVER_ERROR, "访客账号创建失败")
+        return created
+
+    def guest_login(self, *, user_agent: str, client_ip: str) -> TokenPair:
+        """不注册直接进工作台。租约按"未记住我"签发，避免留下长期会话。"""
+        if not settings.allow_guest:
+            raise AuthError(status.HTTP_403_FORBIDDEN, "当前部署未开放访客访问")
+        record = self.ensure_guest()
+        if int(record["disabled"] or 0):
+            raise AuthError(status.HTTP_403_FORBIDDEN, "访客账号已被停用")
+        now = int(time.time())
+        self.store.mark_login_success(str(record["user_id"]))
+        self.store.prune_refreshes(now=now)
+        return self._issue_pair(
+            self._account(record),
+            remember=False,
+            user_agent=user_agent,
+            client_ip=client_ip,
         )
 
     def refresh(self, *, token: str, user_agent: str, client_ip: str) -> TokenPair:
@@ -540,6 +761,39 @@ async def current_user(
         raise _to_http_error(exc) from exc
 
 
+# 访客必须能续期和退出，否则一进门就被自己卡住。
+GUEST_WRITABLE_PATHS = frozenset({"/api/auth/refresh", "/api/auth/logout"})
+
+
+async def guest_write_guard(request: Request, call_next):  # type: ignore[no-untyped-def]
+    """访客会话只读：任何写操作在进入路由之前就 403。
+
+    放在中间件而不是逐个路由加依赖，是因为"默认拒绝"不会漏掉以后新增的写接口。
+    """
+    path = request.url.path
+    if not path.startswith("/api/") or request.method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+    if path in GUEST_WRITABLE_PATHS:
+        return await call_next(request)
+
+    token = _extract_access_token(request)
+    if token:
+        # 中间件不走依赖注入，但测试会用 dependency_overrides 换掉服务，
+        # 所以这里手动认一下覆盖，测试和生产用的是同一段逻辑。
+        override = (request.app.dependency_overrides or {}).get(get_auth_service)
+        service = override() if override else get_auth_service()
+        try:
+            account = service.authenticate(token=token)
+        except AuthError:
+            account = None
+        if account is not None and account.role == ROLE_GUEST:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "访客是只读会话：可以浏览，但不能发起任务、审批或改动配置"},
+            )
+    return await call_next(request)
+
+
 def require_admin(account: Account = Depends(current_user)) -> Account:
     if account.role != ROLE_ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员权限")
@@ -551,7 +805,7 @@ def _user_view(account: Account) -> UserView:
         user_id=account.user_id,
         username=account.username,
         display_name=account.display_name,
-        role=ROLE_ADMIN if account.role == ROLE_ADMIN else "member",
+        role=account.role,
         must_change_password=account.must_change_password,
     )
 
@@ -571,12 +825,32 @@ def _pair_view(pair: TokenPair, account: Account) -> TokenPairView:
 
 
 def _client_ip(request: Request) -> str:
-    """Trusts X-Forwarded-For only because a reverse proxy is the expected
-    deployment; without one the header is attacker-controlled, so it is recorded
-    for display only and never used for authorisation."""
+    """取真实客户端 IP（只在反代之后才有意义）。
+
+    取 X-Forwarded-For 的**最后一段**，而不是第一段：nginx 若用
+    `$proxy_add_x_forwarded_for`，会把客户端自带的头原样拼在最前面
+    （`伪造值, 真实值`），第一段完全由调用方控制 —— 而注册节流正是按这个值计数的，
+    被绕过后"每 IP 每小时 N 次"形同虚设。最后一段在"覆盖写"与"追加写"
+    两种反代写法下都指向真实来源。
+
+    没有反代时这个头由调用方随意伪造，所以部署时必须只允许反代访问 8000，
+    并在反代里把它覆盖成 `$remote_addr`（见 docs/dns-records.md）。
+    前面还有 CDN 时要在 nginx 侧用 real_ip 模块还原（同上文档）。
+
+    在 Cloudflare 后面（隧道或橙云代理）应当改用 `CF-Connecting-IP`：它是 CF 边缘
+    写入的单一地址，而 CF 对 X-Forwarded-For 是**追加**语义（客户端自带的会被拼在
+    最前、末段可能是 CF 边缘地址）。该行为只在 APP_TRUST_CLOUDFLARE_IP=true 时启用，
+    见 docs/cloudflare.md。
+    """
+    if settings.trust_cloudflare_ip:
+        direct = request.headers.get("cf-connecting-ip", "").strip()
+        if direct and len(direct) <= 64:
+            return direct
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if parts:
+            return parts[-1][:64]
     return request.client.host if request.client else ""
 
 
@@ -640,6 +914,56 @@ async def register(
             display_name=payload.display_name,
             user_agent=request.headers.get("user-agent", ""),
             client_ip=ip,
+            website=payload.website,
+            form_elapsed_ms=payload.form_elapsed_ms,
+            captcha_id=payload.captcha_id,
+            captcha_answer=payload.captcha_answer,
+            email=payload.email,
+            email_code=payload.email_code,
+        )
+    except AuthError as exc:
+        raise _to_http_error(exc) from exc
+    account = service.authenticate(token=pair.access_token)
+    set_auth_cookies(response, pair)
+    return _pair_view(pair, account)
+
+
+@auth_router.get("/captcha", response_model=CaptchaView)
+async def captcha(service: AuthService = Depends(get_auth_service)) -> CaptchaView:
+    """出一道算术验证码。不需要登录 —— 注册页要用它，此时还没有账号。"""
+    challenge_id, question = service.issue_captcha()
+    return CaptchaView(
+        challenge_id=challenge_id,
+        question=question,
+        expires_in=settings.captcha_ttl_seconds,
+        # 注册页据此决定要不要显示邮箱那一栏（它没登录，拿不到 /api/system）
+        email_verification_required=settings.smtp_configured(),
+    )
+
+
+@auth_router.post("/email-code", status_code=status.HTTP_202_ACCEPTED)
+async def email_code(
+    payload: EmailCodeRequest, service: AuthService = Depends(get_auth_service)
+) -> dict[str, object]:
+    """发注册邮箱验证码。未配置 SMTP 时返回 503 并说明原因，不会假装发出去了。"""
+    try:
+        ttl = await service.issue_email_code(payload.email)
+    except AuthError as exc:
+        raise _to_http_error(exc) from exc
+    return {"sent": True, "expires_in": ttl, "channel": "email"}
+
+
+@auth_router.post("/guest", response_model=TokenPairView)
+async def guest_login(
+    request: Request,
+    response: Response,
+    service: AuthService = Depends(get_auth_service),
+) -> TokenPairView:
+    """访客入口：不注册也能进工作台，但会话只读 —— 写操作一律 403。"""
+    try:
+        pair = service.guest_login(
+            user_agent=request.headers.get("user-agent", ""),
+            client_ip=_client_ip(request),
         )
     except AuthError as exc:
         raise _to_http_error(exc) from exc

@@ -6,7 +6,7 @@ import "./tools.css";
 // so it stays the final authority for shell spacing and magnification.
 
 export const metadata: Metadata = {
-  title: "Nexus · 通用 Agent 工作台",
+  title: "Neptune · 通用 Agent 工作台",
   description: "Supervisor 驱动的通用多 Agent 任务工作台",
 };
 

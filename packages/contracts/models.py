@@ -15,6 +15,13 @@ class StartTaskRequest(BaseModel):
     use_knowledge_base: bool = True
     # 对话分组：一次对话里的多轮运行共享同一个 id，便于按对话聚合消息。
     conversation_id: str | None = Field(default=None, max_length=64)
+    # 真实写入目标：{"kind": "http|file|database", ...}。给出后会追加审批门禁，
+    # 批准即真写；不给则执行 Agent 只出执行计划，不做任何写入。
+    execution_target: dict[str, object] | None = None
+    # dry_run：走完整流程但不落任何副作用，回执里 mode 会标 simulate。
+    dry_run: bool = False
+    # 运行模式：graph = 固定图编排（默认）；react = 自由 ReAct 循环。
+    run_mode: Literal["graph", "react"] = "graph"
 
 
 class ApprovalDecision(BaseModel):
@@ -101,6 +108,29 @@ class McpServerView(McpServerDraft):
     updated_at: str = ""
 
 
+class ScheduleDraft(BaseModel):
+    """定时任务。cron 为五段表达式：分 时 日 月 周。"""
+
+    name: str = Field(min_length=1, max_length=64)
+    objective: str = Field(min_length=3, max_length=8_000)
+    cron: str = Field(min_length=1, max_length=64)
+    enabled: bool = True
+    agent: str = Field(default="auto", max_length=64)
+    use_knowledge_base: bool = True
+    execution_mode: Literal["auto", "plan_only"] = "auto"
+    run_mode: Literal["graph", "react"] = "graph"
+    execution_target: dict[str, object] | None = None
+
+
+class ScheduleView(ScheduleDraft):
+    schedule_id: str
+    last_run_at: str = ""
+    last_task_id: str = ""
+    next_run_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=256)
@@ -108,12 +138,48 @@ class LoginRequest(BaseModel):
     remember: bool = False
 
 
+# 邮箱不做 DNS 校验（那需要额外的解析库与网络往返），只挡明显不合格式的输入。
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$"
+
+
+class CaptchaView(BaseModel):
+    """图形验证码：服务端出题，答案只存哈希，一次一用。
+
+    这里顺带告诉前端"这个环境要不要验证邮箱" —— 注册页还没登录，拿不到 /api/system，
+    但需要据此决定是否显示邮箱那一栏。
+    """
+
+    challenge_id: str
+    question: str
+    expires_in: int
+    email_verification_required: bool = False
+
+
+class EmailCodeRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=254, pattern=EMAIL_PATTERN)
+
+
 class RegisterRequest(BaseModel):
-    """用户名只收 ASCII 可见字符，避免路由与展示层的编码歧义；中文放显示名里。"""
+    """用户名只收 ASCII 可见字符，避免路由与展示层的编码歧义；中文放显示名里。
+
+    注册端有四道防滥用校验（见 docs/architecture.md「注册端防滥用」）：
+    蜜罐字段、表单填写时长、图形验证码、邮箱验证码。
+    """
 
     username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
     password: str = Field(min_length=8, max_length=256)
     display_name: str | None = Field(default=None, max_length=64)
+
+    # 蜜罐：真实用户看不到这个字段（视觉隐藏 + 不参与 Tab 顺序），机器人往往照填。
+    website: str | None = Field(default=None, max_length=200)
+    # 表单从渲染到提交的耗时，太快说明是脚本直提。
+    form_elapsed_ms: int = Field(default=0, ge=0, le=24 * 60 * 60 * 1000)
+    # 图形验证码
+    captcha_id: str = Field(default="", max_length=64)
+    captcha_answer: str = Field(default="", max_length=12)
+    # 邮箱与邮箱验证码（未配置 SMTP 时不强制）
+    email: str | None = Field(default=None, max_length=254)
+    email_code: str | None = Field(default=None, max_length=12)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -131,7 +197,7 @@ class UserView(BaseModel):
     user_id: str
     username: str
     display_name: str
-    role: Literal["admin", "member"]
+    role: Literal["admin", "member", "guest"]
     must_change_password: bool = False
 
 

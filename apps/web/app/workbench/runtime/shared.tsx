@@ -4,7 +4,11 @@ export type Knowledge = {
   enabled?: boolean;
   bases?: string[];
   available?: number;
-  documents?: Array<{ base: string; name: string }>;
+  // 向量检索会回传扫描篇数与检索方式，用于如实说明"这次用了什么"
+  scanned?: number;
+  mode?: string;
+  embedding?: string;
+  documents?: Array<{ base: string; name: string; score?: number }>;
 };
 export type Task = {
   task_id: string;
@@ -15,6 +19,10 @@ export type Task = {
   phase: string;
   conversation_id?: string | null;
   requested_agent?: string | null;
+  // 真实写入目标 / 演练开关 / 编排方式（固定图 or 自由 ReAct）
+  execution_target?: Record<string, unknown> | null;
+  dry_run?: boolean;
+  run_mode?: string;
   knowledge?: Knowledge;
   task_type?: string | null;
   risk_level?: string | null;
@@ -37,11 +45,24 @@ export function knowledgeSummary(knowledge?: Knowledge): string {
   if (!(knowledge.bases?.length ?? 0)) return "没有启用的知识库";
   const documents = knowledge.documents ?? [];
   if (documents.length) {
-    return `命中 ${documents.length} 篇：${documents.map((item) => item.name).join("、")}`;
+    const names = documents.map((item) => item.name).join("、");
+    return `命中 ${documents.length} 篇：${names}（${retrievalModeText(knowledge)}）`;
   }
   return (knowledge.available ?? 0) > 0
-    ? `已扫描 ${knowledge.available} 篇，本次无关键词命中`
+    ? `已扫描 ${knowledge.available} 篇，本次无命中（${retrievalModeText(knowledge)}）`
     : "知识库暂无文档";
+}
+
+/* 检索方式必须说清楚：向量检索和"向量没命中后回退关键词"是两回事。 */
+export function retrievalModeText(knowledge?: Knowledge): string {
+  if (!knowledge) return "";
+  if (knowledge.mode === "vector") {
+    return `向量检索 · ${knowledge.embedding || "本地向量"}`;
+  }
+  if (knowledge.mode === "keyword") {
+    return knowledge.embedding || "关键词检索";
+  }
+  return "";
 }
 
 /* Labels mirror the role strings the backend writes into agent_trace, so the
@@ -90,7 +111,7 @@ export function statusTone(status: string) {
 }
 
 export function typeText(type?: string | null) {
-  return ({ research: "研究任务", data: "数据任务", code: "软件工程", document: "文档任务", general: "通用任务" } as Record<string, string>)[type ?? ""] ?? "识别中";
+  return ({ chat: "闲聊直答", research: "研究任务", data: "数据任务", code: "软件工程", document: "文档任务", general: "通用任务" } as Record<string, string>)[type ?? ""] ?? "识别中";
 }
 
 export function riskText(risk?: string | null) {
@@ -160,7 +181,38 @@ const phaseStage: Record<string, number> = {
   approval: 3,
   executing: 3,
   verifying: 3,
+  reacting: 3,
+  responding: 3,
 };
+
+/* 阶段的展示文案：直接对应后端 phase 取值，不另造词，
+   这样"界面现在停在哪一步"与流水线真相是同一个东西。 */
+const phaseLabels: Record<string, string> = {
+  intake: "任务理解",
+  planning: "任务规划",
+  dispatching: "分派调度",
+  researching: "研究取证",
+  analyzing: "数据分析",
+  engineering: "软件工程",
+  drafting: "交付物编排",
+  reviewing: "质量审查",
+  approval: "等待人工审批",
+  executing: "真实执行",
+  verifying: "结果核验",
+  reacting: "自由 ReAct 循环",
+  responding: "直接回答",
+  completed: "已完成",
+  planned: "已生成计划",
+  rejected: "已拒绝",
+  needs_human: "需人工介入",
+  timeout: "超时停止",
+  failed: "执行失败",
+};
+
+export function phaseText(phase?: string | null): string {
+  if (!phase) return "未知阶段";
+  return phaseLabels[phase] ?? phase;
+}
 
 export function deriveStages(task: Task): Stage[] {
   const progress = taskProgress(task);

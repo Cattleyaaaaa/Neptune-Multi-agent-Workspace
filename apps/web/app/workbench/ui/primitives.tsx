@@ -289,8 +289,17 @@ export function ConfirmDialog({
 
 /* -------------------------------------------------------------------- forms */
 
-export function FormGrid({ children, columns = 2 }: { children: ReactNode; columns?: 1 | 2 }) {
-  return <div className={`form-grid cols-${columns}`}>{children}</div>;
+export function FormGrid({
+  children,
+  columns = 2,
+  className = "",
+}: {
+  children: ReactNode;
+  columns?: 1 | 2;
+  /* 允许调用点补一个语义类名（例如设置页要限宽）。 */
+  className?: string;
+}) {
+  return <div className={`form-grid cols-${columns} ${className}`.trim()}>{children}</div>;
 }
 
 export function Field({

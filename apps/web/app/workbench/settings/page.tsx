@@ -271,7 +271,7 @@ export default function SettingsPage() {
     </Toolbar>
 
     {section === "profile" && <Card icon={UserCircle} title="个人资料" note="这些信息会出现在审批记录与审计日志中">
-      <FormGrid>
+      <FormGrid columns={1} className="settings-form">
         <Field label="显示名称" required error={errors.displayName}>
           <TextInput value={profile.displayName} onChange={(value) => change({ displayName: value })} invalid={Boolean(errors.displayName)} />
         </Field>
@@ -309,7 +309,7 @@ export default function SettingsPage() {
     </Card>}
 
     {section === "defaults" && <Card icon={GearSix} title="工作台默认值" note="只影响新建任务时的初始状态，不会改动已创建的任务">
-      <FormGrid columns={2}>
+      <FormGrid columns={1} className="settings-form">
         <Field label="默认运行模式" hint="可在运行中心随时临时切换">
           <SegmentedControl
             value={profile.defaultExecutionMode}
@@ -356,7 +356,7 @@ export default function SettingsPage() {
         checked={profile.notifyOnApproval}
         onChange={(value) => change({ notifyOnApproval: value })}
       />
-      <FormGrid columns={1}>
+      <FormGrid columns={1} className="settings-form">
         <Field label="摘要频率" hint="汇总任务运行、失败与用量情况">
           <SelectInput
             value={profile.digest}
@@ -373,7 +373,7 @@ export default function SettingsPage() {
 
     {section === "security" && <>
       <Card icon={Lock} title="修改密码" note={`当前账号：${user?.username ?? "—"}。密码以 PBKDF2 加盐哈希存储，不保存明文`}>
-        <FormGrid columns={1}>
+        <FormGrid columns={1} className="settings-form">
           <Field label="当前密码" required error={pwdErrors.current}>
             <TextInput
               type="password"

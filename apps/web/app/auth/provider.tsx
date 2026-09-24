@@ -18,7 +18,7 @@ export type AuthUser = {
   user_id: string;
   username: string;
   display_name: string;
-  role: "admin" | "member";
+  role: "admin" | "member" | "guest";
   must_change_password: boolean;
 };
 
@@ -33,6 +33,8 @@ type AuthStatus = "loading" | "authenticated" | "anonymous";
 type AuthContextValue = {
   user: AuthUser | null;
   status: AuthStatus;
+  /* 访客是只读会话：后端会拒绝写操作，界面据此禁用入口并说明原因。 */
+  isGuest: boolean;
   accessExpiresAt: string;
   refreshExpiresAt: string;
   reload: () => Promise<void>;
@@ -121,6 +123,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     () => ({
       user: me?.user ?? null,
       status,
+      isGuest: me?.user.role === "guest",
       accessExpiresAt: me?.access_expires_at ?? "",
       refreshExpiresAt: me?.refresh_expires_at ?? "",
       reload,

@@ -54,7 +54,29 @@ const WORKSPACE_KEY = "workspace-config";
 const TASKS_KEY = "task-list";
 
 type AgentConfig = { id: string; name: string; enabled: boolean; mode: string; description: string; task_types: string[] };
-type DocumentItem = { id: string; name: string; size: number; chunks: number; status: string; content: string };
+// 上传时前端会生成 id 并算好 size / chunks / status，但后端只保存 name / content（见 /api/workspace），
+// 而种子数据连这些都没有 —— 所以元信息一律按可选处理：渲染与删除都必须能在缺失时工作，
+// 缺了就不显示，绝不要渲染出 NaN。
+type DocumentItem = { id?: string; name: string; size?: number; chunks?: number; status?: string; content: string };
+
+/** 拼一行文档元信息；缺哪项就不显示哪项。 */
+function documentMeta(doc: DocumentItem): string {
+  const parts: string[] = [];
+  if (typeof doc.size === "number") parts.push(formatSize(doc.size));
+  if (typeof doc.chunks === "number") parts.push(`${doc.chunks} 个切片`);
+  if (doc.status) parts.push(doc.status === "ready" ? "已索引" : doc.status);
+  return parts.join(" · ");
+}
+
+/** 整个知识库的合计元信息：只有拿到数据才显示，否则留空。 */
+function documentLibraryMeta(documents: DocumentItem[]): string {
+  const withMeta = documents.filter((doc) => typeof doc.chunks === "number");
+  if (!withMeta.length) return "";
+  const chunks = withMeta.reduce((sum, doc) => sum + (doc.chunks ?? 0), 0);
+  const size = withMeta.reduce((sum, doc) => sum + (doc.size ?? 0), 0);
+  const suffix = withMeta.length === documents.length ? "" : `（${withMeta.length} 个有元信息）`;
+  return ` · ${chunks} 个切片 · ${formatSize(size)}${suffix}`;
+}
 type KnowledgeBase = { id: string; name: string; description: string; enabled: boolean; documents: DocumentItem[]; embedding_model: string; chunk_size: number; overlap: number };
 type ContextKind = "spec" | "background" | "output" | "boundary";
 /* `description` / `kind` / `tags` are workbench-side organisation metadata: they
@@ -265,7 +287,7 @@ export default function WorkbenchPage() {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "nexus-workspace.json";
+    anchor.download = "neptune-workspace.json";
     anchor.click();
     URL.revokeObjectURL(url);
   }
@@ -764,6 +786,10 @@ function Rag({ config, update, addDocuments }: PanelProps & { addDocuments: (id:
     return active.documents.filter((doc) => doc.name.toLowerCase().includes(keyword));
   }, [active, docQuery]);
 
+  // 文档元信息可能整块缺失（种子数据只有 name/content）：缺了就整块不显示，别显示 0 或 NaN 充数。
+  const totalChunks = active?.documents.reduce((sum, doc) => sum + (doc.chunks ?? 0), 0) ?? 0;
+  const hasChunkMeta = Boolean(active?.documents.some((doc) => typeof doc.chunks === "number"));
+
   function addBase() {
     const id = crypto.randomUUID();
     update((draft) => {
@@ -802,7 +828,9 @@ function Rag({ config, update, addDocuments }: PanelProps & { addDocuments: (id:
               <span><HardDrives weight="duotone" /></span>
               <div>
                 <TextInput value={active.name} onChange={(value) => patchBase(active.id, (base) => { base.name = value; })} />
-                <p>{active.documents.length} 个文档 · {active.documents.reduce((sum, doc) => sum + doc.chunks, 0)} 个切片 · {formatSize(active.documents.reduce((sum, doc) => sum + doc.size, 0))}</p>
+                {/* 元信息可能整个缺失（种子文档只有 name/content），缺了就不显示这部分，
+                    不要用 NaN 凑数。 */}
+                <p>{active.documents.length} 个文档{documentLibraryMeta(active.documents)}</p>
               </div>
               <Switch checked={active.enabled} label="启用知识库" onChange={(value) => patchBase(active.id, (base) => { base.enabled = value; })} />
             </div>
@@ -860,14 +888,18 @@ function Rag({ config, update, addDocuments }: PanelProps & { addDocuments: (id:
       count={visibleDocs.length}
       toolbar={<Toolbar>
         <SearchField value={docQuery} onChange={setDocQuery} placeholder="搜索文档名称" />
-        <span className="toolbar-hint">共 {active.documents.reduce((sum, doc) => sum + doc.chunks, 0)} 个切片</span>
+        {hasChunkMeta && <span className="toolbar-hint">共 {totalChunks} 个切片</span>}
       </Toolbar>}
     >
       {active.documents.length
         ? <div className="document-list padded">
-          {visibleDocs.map((doc) => <div key={doc.id}>
-            <span><Books /><span><strong>{doc.name}</strong><small>{formatSize(doc.size)} · {doc.chunks} 个切片 · {doc.status === "ready" ? "已索引" : doc.status}</small></span></span>
-            <button type="button" aria-label={`删除 ${doc.name}`} onClick={() => patchBase(active.id, (base) => { base.documents = base.documents.filter((item) => item.id !== doc.id); })}><Trash /></button>
+          {/* 后端返回的文档只有 name / content，没有 id，所以用 name 做稳定标识。
+              以前用 doc.id：既触发 React 的 key 警告（key 全是 undefined），
+              又让删除失效 —— `item.id !== doc.id` 变成 `undefined !== undefined`，
+              恒为 false，点一次会把该库里所有文档一起删掉。 */}
+          {visibleDocs.map((doc) => <div key={doc.name}>
+            <span><Books /><span><strong>{doc.name}</strong><small>{documentMeta(doc)}</small></span></span>
+            <button type="button" aria-label={`删除 ${doc.name}`} onClick={() => patchBase(active.id, (base) => { base.documents = base.documents.filter((item) => item.name !== doc.name); })}><Trash /></button>
           </div>)}
           {!visibleDocs.length && <p className="document-empty">没有匹配「{docQuery}」的文档。</p>}
         </div>

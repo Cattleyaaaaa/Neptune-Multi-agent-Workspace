@@ -1,192 +1,15 @@
 "use client";
 
 /* Structured sample data for the workbench pages that have no backend table yet
-   (定时任务 / 工作流 / MCP / Skill / 附件 / 租户 / 可观测性 / Token 用量).
+   (工作流 / 附件 / 可观测性 / 账号设置).
+
+   定时任务与成员已经接上真实接口（/api/schedules、/api/members），它们的种子
+   与本地计算函数随之删除，不要再加回来。
 
    Timestamps are fixed ISO strings on purpose: these seeds render on the first
    paint, so anything derived from `Date.now()` would produce different markup
    on the server and the client and trip React's hydration check. Relative
    labels are only produced from user actions, never during render. */
-
-/* ------------------------------------------------------------------ 定时任务 */
-
-export type RunStatus = "success" | "failed" | "running" | "skipped" | "never";
-
-export type Schedule = {
-  id: string;
-  name: string;
-  objective: string;
-  cron: string;
-  timezone: string;
-  enabled: boolean;
-  mode: "auto" | "plan_only";
-  riskLevel: "low" | "medium" | "high";
-  notify: "none" | "on_failure" | "always";
-  lastRunAt: string | null;
-  lastStatus: RunStatus;
-  nextRunAt: string | null;
-  runCount: number;
-  failureCount: number;
-  owner: string;
-  createdAt: string;
-};
-
-export const scheduleSeeds: Schedule[] = [
-  {
-    id: "sch-daily-brief",
-    name: "每日行业简报",
-    objective: "汇总过去 24 小时行业动态，产出带来源的简报草稿并标注待核实项。",
-    cron: "0 9 * * *",
-    timezone: "Asia/Shanghai",
-    enabled: true,
-    mode: "auto",
-    riskLevel: "low",
-    notify: "on_failure",
-    lastRunAt: "2026-09-18T09:00:00+08:00",
-    lastStatus: "success",
-    nextRunAt: "2026-09-19T09:00:00+08:00",
-    runCount: 42,
-    failureCount: 1,
-    owner: "陈立",
-    createdAt: "2026-07-02T10:20:00+08:00",
-  },
-  {
-    id: "sch-weekly-quality",
-    name: "周度交付质量巡检",
-    objective: "抽查本周交付物，按质量门禁逐项打分并输出问题清单。",
-    cron: "0 10 * * 1",
-    timezone: "Asia/Shanghai",
-    enabled: true,
-    mode: "plan_only",
-    riskLevel: "low",
-    notify: "always",
-    lastRunAt: "2026-09-14T10:00:00+08:00",
-    lastStatus: "success",
-    nextRunAt: "2026-09-21T10:00:00+08:00",
-    runCount: 11,
-    failureCount: 0,
-    owner: "陈立",
-    createdAt: "2026-07-05T14:05:00+08:00",
-  },
-  {
-    id: "sch-csv-refresh",
-    name: "经营数据入库",
-    objective: "解析每日导出的经营 CSV，计算核心指标并回写汇总表。",
-    cron: "30 2 * * *",
-    timezone: "Asia/Shanghai",
-    enabled: false,
-    mode: "auto",
-    riskLevel: "medium",
-    notify: "on_failure",
-    lastRunAt: "2026-09-17T02:30:00+08:00",
-    lastStatus: "failed",
-    nextRunAt: null,
-    runCount: 68,
-    failureCount: 4,
-    owner: "李楠",
-    createdAt: "2026-05-18T09:41:00+08:00",
-  },
-  {
-    id: "sch-release-check",
-    name: "发布前合规检查",
-    objective: "检索发布说明与合规清单，逐条比对并给出阻断项。",
-    cron: "0 */6 * * *",
-    timezone: "Asia/Shanghai",
-    enabled: true,
-    mode: "auto",
-    riskLevel: "high",
-    notify: "always",
-    lastRunAt: "2026-09-18T12:00:00+08:00",
-    lastStatus: "running",
-    nextRunAt: "2026-09-18T18:00:00+08:00",
-    runCount: 25,
-    failureCount: 2,
-    owner: "王砚",
-    createdAt: "2026-08-01T16:12:00+08:00",
-  },
-  {
-    id: "sch-code-inventory",
-    name: "代码库只读盘点",
-    objective: "盘点仓库结构、依赖与待办，输出变更影响面清单。",
-    cron: "0 20 * * 5",
-    timezone: "Asia/Shanghai",
-    enabled: false,
-    mode: "plan_only",
-    riskLevel: "low",
-    notify: "none",
-    lastRunAt: null,
-    lastStatus: "never",
-    nextRunAt: null,
-    runCount: 0,
-    failureCount: 0,
-    owner: "李楠",
-    createdAt: "2026-09-12T11:30:00+08:00",
-  },
-  {
-    id: "sch-token-report",
-    name: "月度用量结算",
-    objective: "汇总当月 Token 消耗与成本，生成结算报表并附异常明细。",
-    cron: "0 8 1 * *",
-    timezone: "Asia/Shanghai",
-    enabled: true,
-    mode: "auto",
-    riskLevel: "low",
-    notify: "always",
-    lastRunAt: "2026-09-01T08:00:00+08:00",
-    lastStatus: "success",
-    nextRunAt: "2026-10-01T08:00:00+08:00",
-    runCount: 3,
-    failureCount: 0,
-    owner: "王砚",
-    createdAt: "2026-06-28T15:00:00+08:00",
-  },
-];
-
-export const cronOptions = [
-  { value: "*/15 * * * *", label: "每 15 分钟" },
-  { value: "0 * * * *", label: "每小时" },
-  { value: "0 9 * * *", label: "每天 09:00" },
-  { value: "30 2 * * *", label: "每天 02:30" },
-  { value: "0 */6 * * *", label: "每 6 小时" },
-  { value: "0 10 * * 1", label: "每周一 10:00" },
-  { value: "0 20 * * 5", label: "每周五 20:00" },
-  { value: "0 8 1 * *", label: "每月 1 日 08:00" },
-];
-
-export const cronLabels: Record<string, string> = Object.fromEntries(
-  cronOptions.map((option) => [option.value, option.label]),
-);
-
-/* Minimal cron → next-run calculation for the presets above. Runs only from
-   user actions, so Date.now() is safe here. */
-export function nextRunFromCron(cron: string, from = new Date()): string | null {
-  const next = new Date(from.getTime());
-  next.setSeconds(0, 0);
-  const [minute = "0", hour = "0", , , , weekday] = cron.split(" ");
-  const step = minute.startsWith("*/") ? Number(minute.slice(2)) : null;
-
-  if (step) {
-    next.setMinutes(Math.ceil((next.getMinutes() + 1) / step) * step);
-    if (next.getMinutes() >= 60) { next.setMinutes(0); next.setHours(next.getHours() + 1); }
-    return next.toISOString();
-  }
-  if (cron === "0 */6 * * *") {
-    const target = [0, 6, 12, 18].find((value) => value > next.getHours()) ?? 0;
-    if (target <= next.getHours()) next.setDate(next.getDate() + 1);
-    next.setHours(target, 0, 0, 0);
-    return next.toISOString();
-  }
-  if (weekday) {
-    const target = Number(weekday);
-    const delta = (target - next.getDay() + 7) % 7 || 7;
-    next.setDate(next.getDate() + delta);
-    next.setHours(Number(hour), Number(minute), 0, 0);
-    return next.toISOString();
-  }
-  next.setHours(Number(hour), Number(minute), 0, 0);
-  if (next.getTime() <= from.getTime()) next.setDate(next.getDate() + 1);
-  return next.toISOString();
-}
 
 /* --------------------------------------------------------------- 工作流编排 */
 
@@ -365,66 +188,6 @@ export const assetSeeds: Asset[] = [
   { id: "as-10", name: "渠道投放明细.xlsx", kind: "table", mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", size: 524_288, tags: ["投放", "渠道"], owner: "王砚", uploadedAt: "2026-09-05T09:41:00+08:00", scope: "task", status: "ready", usedBy: ["经营数据周报"] },
 ];
 
-/* ------------------------------------------------------------- 租户与成员 */
-
-export type MemberRole = "owner" | "admin" | "builder" | "operator" | "viewer";
-
-export type Member = {
-  id: string;
-  name: string;
-  email: string;
-  role: MemberRole;
-  status: "active" | "invited" | "suspended";
-  tenantId: string;
-  lastActiveAt: string | null;
-  joinedAt: string;
-  approvals: number;
-  tasks: number;
-};
-
-export type Tenant = {
-  id: string;
-  name: string;
-  plan: "free" | "team" | "enterprise" | "trial";
-  region: string;
-  seats: number;
-  createdAt: string;
-  status: "active" | "trial";
-};
-
-export const roleLabels: Record<MemberRole, string> = {
-  owner: "所有者",
-  admin: "管理员",
-  builder: "构建者",
-  operator: "执行者",
-  viewer: "只读",
-};
-
-export const tenantSeeds: Tenant[] = [
-  { id: "tn-main", name: "Nexus 主工作区", plan: "enterprise", region: "cn-east", seats: 30, createdAt: "2026-03-01T09:00:00+08:00", status: "active" },
-  { id: "tn-lab", name: "算法实验室", plan: "team", region: "cn-east", seats: 8, createdAt: "2026-06-12T10:30:00+08:00", status: "active" },
-  { id: "tn-pilot", name: "客户试点空间", plan: "trial", region: "cn-south", seats: 5, createdAt: "2026-09-01T14:00:00+08:00", status: "trial" },
-];
-
-export const memberSeeds: Member[] = [
-  { id: "mb-1", name: "陈立", email: "chenli@example.com", role: "owner", status: "active", tenantId: "tn-main", lastActiveAt: "2026-09-18T16:42:00+08:00", joinedAt: "2026-03-01T09:00:00+08:00", approvals: 18, tasks: 96 },
-  { id: "mb-2", name: "李楠", email: "linan@example.com", role: "admin", status: "active", tenantId: "tn-main", lastActiveAt: "2026-09-18T15:20:00+08:00", joinedAt: "2026-03-04T11:12:00+08:00", approvals: 26, tasks: 143 },
-  { id: "mb-3", name: "王砚", email: "wangyan@example.com", role: "operator", status: "active", tenantId: "tn-main", lastActiveAt: "2026-09-18T14:05:00+08:00", joinedAt: "2026-04-18T09:41:00+08:00", approvals: 41, tasks: 77 },
-  { id: "mb-4", name: "周艾", email: "zhouai@example.com", role: "builder", status: "active", tenantId: "tn-lab", lastActiveAt: "2026-09-17T19:33:00+08:00", joinedAt: "2026-06-12T10:30:00+08:00", approvals: 3, tasks: 52 },
-  { id: "mb-5", name: "徐汀", email: "xuting@example.com", role: "viewer", status: "invited", tenantId: "tn-main", lastActiveAt: null, joinedAt: "2026-09-16T17:00:00+08:00", approvals: 0, tasks: 0 },
-  { id: "mb-6", name: "何岸", email: "hean@example.com", role: "builder", status: "active", tenantId: "tn-pilot", lastActiveAt: "2026-09-18T11:48:00+08:00", joinedAt: "2026-09-01T14:00:00+08:00", approvals: 0, tasks: 21 },
-  { id: "mb-7", name: "服务账号 · CI", email: "ci@service.local", role: "operator", status: "active", tenantId: "tn-main", lastActiveAt: "2026-09-18T16:55:00+08:00", joinedAt: "2026-05-02T08:00:00+08:00", approvals: 0, tasks: 310 },
-  { id: "mb-8", name: "苏禾", email: "suhe@example.com", role: "builder", status: "suspended", tenantId: "tn-lab", lastActiveAt: "2026-08-29T10:11:00+08:00", joinedAt: "2026-06-20T09:00:00+08:00", approvals: 0, tasks: 8 },
-];
-
-export const rolePermissions: Array<{ role: MemberRole; scopes: string[] }> = [
-  { role: "owner", scopes: ["全部配置", "成员与租户", "审批所有高风险动作", "导出审计"] },
-  { role: "admin", scopes: ["全部配置", "成员管理", "审批高风险动作"] },
-  { role: "builder", scopes: ["Agent / 工作流 / RAG / Skill 配置", "发起任务"] },
-  { role: "operator", scopes: ["发起任务", "审批授权范围内的动作"] },
-  { role: "viewer", scopes: ["只读查看看板与审计"] },
-];
-
 /* ---------------------------------------------------------------- 观测数据 */
 
 export const usageDaily = [
@@ -537,18 +300,10 @@ export const apiKeySeeds = [
 export const sessionSeeds = [
   { id: "se-1", device: "Windows · Chrome 128", ip: "10.12.4.31", location: "上海", at: "2026-09-18T16:58:00+08:00", current: true },
   { id: "se-2", device: "macOS · Safari 18", ip: "10.12.4.77", location: "上海", at: "2026-09-17T21:14:00+08:00", current: false },
-  { id: "se-3", device: "iOS · Nexus App", ip: "172.20.8.19", location: "杭州", at: "2026-09-15T08:02:00+08:00", current: false },
+  { id: "se-3", device: "iOS · Neptune App", ip: "172.20.8.19", location: "杭州", at: "2026-09-15T08:02:00+08:00", current: false },
 ];
 
 /* --------------------------------------------------------------- 格式化工具 */
-
-/* Editing forms work on the entity minus its id; a destructured rest element
-   would leave an unused binding behind, so the id is dropped explicitly. */
-export function omitId<T extends { id: string }>(value: T): Omit<T, "id"> {
-  const copy: Record<string, unknown> = { ...value };
-  delete copy.id;
-  return copy as Omit<T, "id">;
-}
 
 export function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
