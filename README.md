@@ -101,12 +101,3 @@ uv run uvicorn apps.api.main:app --reload
 | 治理与观测 | 治理策略、可观测性（真实运行统计）、Token 用量（真实运行量；无用量上报时如实说明）、运行环境 |
 | 工作区设置 | 成员与角色（真实账号表）、账号设置 |
 
-页面与数据来源的完整对照见 [`docs/architecture.md`](docs/architecture.md#工作台信息架构)。
-
-## 文档
-
-- [`docs/architecture.md`](docs/architecture.md) — 设计与扩展说明
-- [`docs/deployment.md`](docs/deployment.md) — 部署到域名的结论、实测证据与架构限制
-- [`docs/deployment-checklist.md`](docs/deployment-checklist.md) — 分步部署命令 + 每步验收
-- [`docs/dns-records.md`](docs/dns-records.md) — 域名解析记录（同源部署只需 1 条 A 记录）
-- [`docs/cloudflare.md`](docs/cloudflare.md) — Cloudflare 隧道接入（不需要公网 IP，也不需要 nginx）
