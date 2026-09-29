@@ -52,7 +52,7 @@
 
 ## 本地运行
 
-要求：Python 3.12+、[uv](https://docs.astral.sh/uv/)、Node.js 20+ 和 pnpm。
+要求：Node.js 20+ 和 pnpm。
 
 ```powershell
 uv sync --dev
