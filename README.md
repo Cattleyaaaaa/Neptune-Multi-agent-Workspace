@@ -48,7 +48,7 @@
 |---|---|
 | 后端 | Java · LangGraph4j · SSE · SQLite · PyJWT |
 | 前端 | Next.js 15 (App Router) · React 19 · TypeScript |
-| 包管理 | `uv`（Python）· `pnpm`（monorepo） |
+| 包管理 | `maven`（Java）· `pnpm`（monorepo） |
 
 ## 本地运行
 
