@@ -46,7 +46,7 @@
 
 | 层 | 技术 |
 |---|---|
-| 后端 | Python 3.12+ · FastAPI · LangGraph · SSE · SQLite · PyJWT |
+| 后端 | Java · LangGraph4j · SSE · SQLite · PyJWT |
 | 前端 | Next.js 15 (App Router) · React 19 · TypeScript |
 | 包管理 | `uv`（Python）· `pnpm`（monorepo） |
 
